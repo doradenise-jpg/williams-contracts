@@ -41,7 +41,7 @@ jobs:
   lint:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4.1.1
+      - uses: actions/checkout@v7
 
       - name: Syntax-check shell scripts
         run: |
@@ -74,7 +74,7 @@ jobs:
     env:
       ACTIONLINT_VERSION: 1.7.7
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - name: Install pinned actionlint
         run: |
@@ -96,7 +96,7 @@ jobs:
   deploy-sandbox:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - name: Install Rust wasm32v1-none target
         run: rustup target add wasm32v1-none
@@ -124,7 +124,7 @@ jobs:
     # updating the spec will fail here.
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - name: Install Rust wasm32v1-none target
         run: rustup target add wasm32v1-none
