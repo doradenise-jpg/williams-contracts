@@ -237,6 +237,12 @@ mod total_locked_ttl_maintenance_test;
 #[cfg(test)]
 mod issue_184_test;
 
+/// Regression tests for issue #243: `maintain_failed_payout` renews an
+/// existing positive failed-payout liability without transferring tokens,
+/// creating absent liabilities, or changing recorded amounts.
+#[cfg(test)]
+mod issue_102_test;
+
 /// Regression test for issue #185: `add_hashed_beneficiary` emits its lifecycle event.
 #[cfg(test)]
 mod issue_185_test;
@@ -5405,6 +5411,49 @@ impl WillContract {
     /// - [`WillError::WillNotFound`] if no archived will exists with this id.
     pub fn extend_archived_will_ttl(env: Env, will_id: u64) {
         if let Err(err) = storage::extend_archived_will_ttl(&env, will_id) {
+            panic_with_error!(&env, err);
+        }
+    }
+
+    /// Refreshes the storage TTL of an existing positive failed-payout
+    /// liability recorded for the exact tuple `(will_id, token, recipient)`
+    /// (#243).
+    ///
+    /// A failed payout recorded by [`WillContract::distribute`] lives under
+    /// [`storage::DataKey::FailedPayout`] and is only ever extended when the
+    /// liability is first recorded. If the recipient or token stays
+    /// unavailable for longer than the entry's rent window, the liability
+    /// record itself can lapse even though the debt is still owed. This
+    /// entrypoint is the bounded maintenance path for that case: it renews
+    /// the TTL of the requested liability **without** transferring tokens,
+    /// **without** loading the parent will, and **without** modifying the
+    /// recorded amount.
+    ///
+    /// # Behaviour
+    /// - Only the exact `(will_id, token, recipient)` tuple is touched; no
+    ///   other liability, index or will entry is read or written.
+    /// - The recorded amount is preserved verbatim. Maintenance can never
+    ///   create a liability or change one.
+    /// - Callable by anyone (no `require_auth`): the operation only pays rent
+    ///   for a debt the protocol already owes, so it is safe to leave to
+    ///   keepers.
+    /// - Remains usable after the parent will has been archived, because the
+    ///   parent will is never looked up.
+    ///
+    /// # Archived entries
+    /// If the liability entry has already been archived by the network, this
+    /// call cannot renew it: Soroban's persistent-storage API cannot
+    /// distinguish a never-written key from an archived one, so the entry
+    /// must first be restored through a network-level state-restore
+    /// transaction. This entrypoint never recreates an absent liability and
+    /// never invents an amount for one.
+    ///
+    /// # Panics
+    /// - [`WillError::PayoutNotFound`] if no positive liability is recorded
+    ///   for the exact tuple (including when the entry has been archived by
+    ///   the network — see above).
+    pub fn maintain_failed_payout(env: Env, will_id: u64, token: Address, recipient: Address) {
+        if let Err(err) = storage::extend_failed_payout_ttl(&env, will_id, &token, &recipient) {
             panic_with_error!(&env, err);
         }
     }

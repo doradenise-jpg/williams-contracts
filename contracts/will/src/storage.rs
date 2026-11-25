@@ -504,6 +504,16 @@ pub fn is_live_status(status: WillStatus) -> bool {
     )
 }
 
+/// Maximum number of wills a single [`recompute_protocol_stats_chunk`] call
+/// may scan (#242).
+///
+/// Each will in the range costs one persistent-storage read, and Soroban caps
+/// a transaction's ledger read footprint (40 entries) and CPU instructions.
+/// A `batch_size` above this cap is rejected with
+/// [`WillError::InvalidChunkSize`] rather than silently clamped, so an
+/// off-chain audit client cannot believe it scanned more ids than it did.
+pub const MAX_STATS_CHUNK_SIZE: u32 = 20;
+
 /// Reads a `DataKey::Will` entry through the schema-compatible decoder.
 ///
 /// Every read of a will entry in this module goes through here so a legacy
@@ -525,18 +535,35 @@ fn decode_will_entry(env: &Env, id: u64) -> Option<Will> {
     }
 }
 
-/// Recomputes protocol statistics across a bounded range of will IDs: `[start_id, start_id + batch_size)`.
+/// Recomputes protocol statistics across a bounded range of will IDs:
+/// `[start_id, start_id + batch_size)`.
 ///
 /// Returns `(chunk_stats, next_id, is_complete)`:
 /// - `chunk_stats`: live will counts and balance totals accumulated within this range.
 /// - `next_id`: next will ID to query in subsequent chunks.
 /// - `is_complete`: true if `last_id` has been reached.
 ///
+/// # Argument semantics (#242)
+///
+/// - `batch_size` must be in `1..=MAX_STATS_CHUNK_SIZE`. A zero size is
+///   rejected with [`WillError::InvalidChunkSize`] — it can never report a
+///   populated registry as fully scanned — and a size above the cap is
+///   rejected rather than clamped.
+/// - `start_id` is inclusive. `start_id == 0` is treated as `1`, the first
+///   id ever allocated. A `start_id` beyond the last allocated id yields an
+///   empty chunk that reports completion.
+/// - The end id is computed with checked arithmetic and clamped to
+///   `last_id`, so a large `start_id`/`batch_size` pair can never overflow.
+/// - The continuation cursor is `end_id + 1`, computed with checked
+///   arithmetic: at `u64::MAX` the chunk reports completion instead of
+///   wrapping to `0`.
+///
 /// # Transaction limit constraints
 /// Soroban imposes strict per-transaction limits on ledger read footprints (maximum 40
 /// read entries) and CPU instructions. Recomputing across all wills in a single transaction
 /// will exceed the transaction footprint budget once `last_id` exceeds a few dozen wills.
-/// For on-chain execution, callers must use chunked execution with a bounded `batch_size` (e.g. <= 20).
+/// For on-chain execution, callers must use chunked execution with a bounded `batch_size`
+/// (at most [`MAX_STATS_CHUNK_SIZE`]).
 pub fn recompute_protocol_stats_chunk(
     env: &Env,
     start_id: u64,
@@ -559,7 +586,14 @@ pub fn recompute_protocol_stats_chunk(
         ));
     }
 
-    let end_id = (start_id + batch_size as u64 - 1).min(last_id);
+    // Subtraction-first: `batch_size >= 1`, so `batch_size - 1` cannot
+    // underflow, and the checked add cannot trap on a huge `start_id`.
+    let span = (batch_size as u64) - 1;
+    let end_id = match start_id.checked_add(span) {
+        Some(raw_end) => raw_end.min(last_id),
+        None => last_id,
+    };
+
     let mut active_will_count: u64 = 0;
     let mut totals: Map<Address, i128> = Map::new(env);
     let mut id = start_id;
@@ -575,6 +609,9 @@ pub fn recompute_protocol_stats_chunk(
                 }
             }
         }
+        if id == end_id {
+            break;
+        }
         id += 1;
     }
 
@@ -586,8 +623,11 @@ pub fn recompute_protocol_stats_chunk(
         });
     }
 
-    let next_id = end_id + 1;
-    let is_complete = next_id > last_id;
+    // Continuation cursor: completion at `u64::MAX` rather than wrapping.
+    let (next_id, is_complete) = match end_id.checked_add(1) {
+        Some(next) => (next, next > last_id),
+        None => (end_id, true),
+    };
 
     Ok((
         ProtocolStats {
@@ -769,6 +809,38 @@ pub fn save_will(env: &Env, will: &Will) {
         env.storage()
             .persistent()
             .extend_ttl(&key, LIFETIME_THRESHOLD, BUMP_AMOUNT);
+        // Keep the retained audit trail and its sequence counter alive
+        // alongside the live will (#244). Settings and guardian-consent
+        // changes save the will without appending history, so without this
+        // the trail could lapse while the will itself stays usable.
+        refresh_history_ttl(env, will.id);
+    }
+}
+
+/// Refreshes the TTL of a will's retained `WillHistory` trail and its
+/// `WillHistorySeq` counter together, if they exist (#244).
+///
+/// This is the single retention policy for the audit trail of a live will:
+/// both keys are extended to the same [`BUMP_AMOUNT`] horizon whenever the
+/// will itself is refreshed, so a long-lived estate never needs a separate
+/// restoration step before its history is readable or its next append is
+/// usable. Missing keys are left alone — there is nothing to retain, and
+/// creating them here would fabricate state.
+///
+/// Terminal wills are not refreshed: [`save_will`] skips this for `Released`
+/// and `Cancelled`, and [`archive_will`] removes both keys outright.
+pub fn refresh_history_ttl(env: &Env, will_id: u64) {
+    let history_key = DataKey::WillHistory(will_id);
+    if env.storage().persistent().has(&history_key) {
+        env.storage()
+            .persistent()
+            .extend_ttl(&history_key, LIFETIME_THRESHOLD, BUMP_AMOUNT);
+    }
+    let seq_key = DataKey::WillHistorySeq(will_id);
+    if env.storage().persistent().has(&seq_key) {
+        env.storage()
+            .persistent()
+            .extend_ttl(&seq_key, LIFETIME_THRESHOLD, BUMP_AMOUNT);
     }
 }
 
@@ -1733,12 +1805,38 @@ pub const MAX_PAGE_SIZE: u32 = 50;
 /// any caller that wants it.
 fn next_history_seq(env: &Env, will_id: u64) -> u64 {
     let key = DataKey::WillHistorySeq(will_id);
-    let next: u64 = env.storage().persistent().get(&key).unwrap_or(0) + 1;
+    let stored: u64 = env.storage().persistent().get(&key).unwrap_or(0);
+    // A missing (or lapsed) counter must not silently restart numbering while
+    // retained history already contains larger sequences (#244). Fall back to
+    // the largest seq present in the trail so numbering stays monotonic.
+    let floor = if stored == 0 {
+        max_retained_history_seq(env, will_id)
+    } else {
+        stored
+    };
+    let next = floor.saturating_add(1);
     env.storage().persistent().set(&key, &next);
     env.storage()
         .persistent()
         .extend_ttl(&key, LIFETIME_THRESHOLD, BUMP_AMOUNT);
     next
+}
+
+/// Returns the largest `seq` present in `will_id`'s retained history, or `0`
+/// when the trail is empty or absent.
+fn max_retained_history_seq(env: &Env, will_id: u64) -> u64 {
+    let history: Vec<WillStatusTransition> = env
+        .storage()
+        .persistent()
+        .get(&DataKey::WillHistory(will_id))
+        .unwrap_or_else(|| Vec::new(env));
+    let mut max_seq: u64 = 0;
+    for entry in history.iter() {
+        if entry.seq > max_seq {
+            max_seq = entry.seq;
+        }
+    }
+    max_seq
 }
 
 /// Appends a status transition entry to `will_id`'s on-chain audit trail.
@@ -1783,10 +1881,13 @@ pub fn append_history(env: &Env, will_id: u64, transition: &WillStatusTransition
 /// [`paginate_history`] instead of taking the whole vector.
 pub fn get_history(env: &Env, will_id: u64) -> Vec<WillStatusTransition> {
     let key = DataKey::WillHistory(will_id);
-    env.storage()
-        .persistent()
-        .get(&key)
-        .unwrap_or_else(|| Vec::new(env))
+    let history: Option<Vec<WillStatusTransition>> = env.storage().persistent().get(&key);
+    if history.is_some() {
+        // A read of a live will's trail counts as activity for retention, so
+        // the trail and its counter stay recoverable together (#244).
+        refresh_history_ttl(env, will_id);
+    }
+    history.unwrap_or_else(|| Vec::new(env))
 }
 
 /// Returns a bounded page of `will_id`'s audit trail, oldest-first.

@@ -5,7 +5,9 @@
 #
 # These recipes mirror exactly what .github/workflows/test.yml and
 # .github/workflows/audit.yml run in CI, so `just ci` locally is a strong
-# predictor of whether a PR will pass.
+# predictor of whether a PR will pass. `just ci` also runs the resource-cost
+# drift check (`costs-check`), which fails if docs/RESOURCE_COSTS.md no longer
+# matches measured output.
 
 set shell := ["bash", "-uc"]
 
@@ -55,6 +57,11 @@ spec:
 costs:
     scripts/check_resource_costs.sh
 
+# Verify docs/RESOURCE_COSTS.md matches measured resource costs (fails on
+# drift). Skipped profiling is reported as skipped, never as a match.
+costs-check:
+    scripts/check_resource_costs.sh --check
+
 # Deploy the contract to testnet.
 deploy-testnet:
     scripts/deploy-testnet.sh
@@ -65,4 +72,4 @@ fuzz-create:
     cargo +nightly fuzz run create_will
 
 # Run everything CI runs, in order.
-ci: fmt-check lint test build spec
+ci: fmt-check lint test build spec costs-check

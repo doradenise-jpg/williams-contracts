@@ -11,10 +11,12 @@
 # here, not a fuzzy tolerance.
 #
 # If the profile module is disabled (mod profile; is commented out in lib.rs),
-# the script exits cleanly with an informational message rather than failing
-# with a confusing "Could not find a profile table" error (issue #60).
+# the script fails by default so a skipped profiling run can never be mistaken
+# for a verified match (issue #60, #241). Set ALLOW_SKIPPED_PROFILE_COSTS=1 to
+# opt out explicitly (e.g. for local work on unrelated changes).
 #
 # Usage: scripts/check_resource_costs.sh
+=======
 
 set -euo pipefail
 
@@ -29,10 +31,17 @@ cargo_bin="${CARGO_BIN:-cargo}"
 # Detect whether the profile module is active in lib.rs.
 # The line is considered disabled when it is commented out (leading // or #).
 if ! grep -qE '^[[:space:]]*mod profile;' contracts/will/src/lib.rs; then
-  echo "INFO: The profile module (mod profile;) is currently disabled in"
-  echo "      contracts/will/src/lib.rs. Resource-cost profiling is skipped."
-  echo "      To enable it, uncomment the 'mod profile;' line and re-run this script."
-  exit 0
+  if [ "${ALLOW_SKIPPED_PROFILE_COSTS:-0}" = "1" ]; then
+    echo "INFO: The profile module (mod profile;) is currently disabled in"
+    echo "      contracts/will/src/lib.rs. Resource-cost profiling is skipped"
+    echo "      (ALLOW_SKIPPED_PROFILE_COSTS=1). Measurements were NOT verified."
+    exit 0
+  fi
+  echo "ERROR: The profile module (mod profile;) is disabled in" >&2
+  echo "       contracts/will/src/lib.rs, so resource costs cannot be verified." >&2
+  echo "       Uncomment the 'mod profile;' line and re-run this script, or set" >&2
+  echo "       ALLOW_SKIPPED_PROFILE_COSTS=1 to skip the check explicitly." >&2
+  exit 1
 fi
 
 extract_table() {
