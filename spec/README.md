@@ -15,6 +15,10 @@ file to detect spec drift before it ships.
   after the `version` field in `contracts/will/Cargo.toml` at the time of
   export (e.g. `will-v0.1.0.json`, `will-v1.3.0.json`). Never overwritten once
   published; a new crate version gets a new file.
+- `will-spec.schema.json` — the JSON Schema (draft 2020-12) describing the
+  repository-specific `functions` / `inputs` / `types` representation used by
+  the snapshot files. Both `will-v0.1.0.json` and `will-v1.3.0.json` declare
+  `"$schema": "./will-spec.schema.json"`, which resolves to this file.
 - `will-v0.1.0.json` — initial baseline specification snapshot.
 - `will-v1.4.0.json` — adds `get_will_history_page_v2` with an exclusive
   `Option<u64>` cursor. To continue paging, pass the last returned
@@ -47,6 +51,29 @@ file to detect spec drift before it ships.
     `WillPage`, `GuardianVoteRecord`, updated `Will` / `Beneficiary` /
     `Guardian` / `WillStatusTransition` fields, and `WillError` codes `1`–`58`
     (including `InvalidDelegate = 58`).
+
+## Schema and validation
+
+The schema is **additive**: it was published after the snapshots and does not
+rewrite them. The bytes of `will-v0.1.0.json` and `will-v1.3.0.json` are
+preserved unchanged as the historical record; only their `$schema` reference
+now resolves to a real, documented schema. Both existing artifact shapes
+validate against it, so no legacy exception is required.
+
+Validate a snapshot with any draft 2020-12 JSON-schema validator, for example:
+
+```bash
+# Python (jsonschema >= 4.x)
+python -m jsonschema -i spec/will-v1.3.0.json spec/will-spec.schema.json
+python -m jsonschema -i spec/will-v0.1.0.json spec/will-spec.schema.json
+```
+
+Malformed documents must be rejected, including:
+
+- a function entry missing its `inputs` array,
+- unknown top-level keys or unknown shapes for `functions` / `inputs` /
+  `types` entries,
+- type entries that are not objects with the expected fields.
 
 ## How the artifact is produced
 
