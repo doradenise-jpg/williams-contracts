@@ -21,7 +21,40 @@ use crate::WillContractClient;
 enum DataKey {
     Balance(Address),
     ReentrancyTarget,
+    /// Test-only bookkeeping: number of callback attempts recorded so far.
+    CallbackAttempts,
+    /// Test-only bookkeeping: normalized classification of the most recent
+    /// callback attempt.
+    LastCallbackResult,
+    /// Test-only bookkeeping: which callback was most recently attempted.
+    LastCallbackKind,
 }
+
+/// Normalized classification of a single malicious-callback attempt.
+///
+/// This is deliberately coarse: it distinguishes "the callback was never
+/// attempted", "the host rejected the invocation before the contract ran"
+/// (e.g. auth/authorization failure at dispatch) and "the contract ran and
+/// returned a declared error". It makes no claim about reentry semantics.
+#[contracttype]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum CallbackOutcome {
+    /// No callback has been attempted yet (or bookkeeping was reset).
+    NotAttempted,
+    /// The callback was attempted and the contract returned `Ok`.
+    Succeeded,
+    /// The callback was attempted and the contract returned a declared
+    /// contract error (`try_*` yielded `Err(Ok(_))`).
+    ContractError,
+    /// The callback was attempted but the host rejected the invocation
+    /// before the contract entrypoint ran (`try_*` yielded `Err(Err(_))`),
+    /// e.g. an authorization or dispatch failure.
+    HostRejection,
+}
+
+/// Upper bound on recorded callback attempts, so bookkeeping stays bounded
+/// even if a token is (mis)configured to fire many times.
+const MAX_RECORDED_CALLBACK_ATTEMPTS: u32 = 32;
 
 /// Which will-contract entrypoint to call back into during `transfer`.
 #[contracttype]
@@ -183,6 +216,49 @@ impl MaliciousToken {
         );
     }
 
+    /// Resets the callback bookkeeping (attempt count and last result) without
+    /// touching token balances or the configured reentrancy target.
+    pub fn reset_callback_log(env: Env) {
+        env.storage()
+            .instance()
+            .set(&DataKey::CallbackAttempts, &0u32);
+        env.storage()
+            .instance()
+            .set(&DataKey::LastCallbackResult, &CallbackOutcome::NotAttempted);
+        env.storage()
+            .instance()
+            .set(&DataKey::LastCallbackKind, &0u32);
+    }
+
+    /// Returns how many callback attempts have been recorded (bounded by
+    /// `MAX_RECORDED_CALLBACK_ATTEMPTS`).
+    pub fn callback_attempts(env: Env) -> u32 {
+        env.storage()
+            .instance()
+            .get(&DataKey::CallbackAttempts)
+            .unwrap_or(0)
+    }
+
+    /// Returns the normalized classification of the most recent callback
+    /// attempt.
+    pub fn last_callback_result(env: Env) -> CallbackOutcome {
+        env.storage()
+            .instance()
+            .get(&DataKey::LastCallbackResult)
+            .unwrap_or(CallbackOutcome::NotAttempted)
+    }
+
+    /// Returns the discriminant of the most recently attempted callback
+    /// (`0` = none, `1` = ReleaseInheritance, `2` = TopUp, `3` = MergeWills,
+    /// `4` = RevealAndClaim). Tests can compare this against the expected
+    /// selection to prove the intended callback fired.
+    pub fn last_callback_kind(env: Env) -> u32 {
+        env.storage()
+            .instance()
+            .get(&DataKey::LastCallbackKind)
+            .unwrap_or(0)
+    }
+
     pub fn transfer(env: Env, from: Address, to: Address, amount: i128) {
         let from_key = DataKey::Balance(from);
         let from_balance: i128 = env.storage().instance().get(&from_key).unwrap_or(0);
@@ -202,50 +278,94 @@ impl MaliciousToken {
             .get::<_, ReentrancyTarget>(&DataKey::ReentrancyTarget)
         {
             let will_client = WillContractClient::new(&env, &target.will_contract);
-            match target.callback {
+            // Record the attempt *before* invoking the callback so the log is
+            // accurate even if the invocation traps. Bookkeeping only touches
+            // instance storage keys that are never read by `transfer`'s balance
+            // logic, so it cannot alter balances or recursively re-trigger a
+            // callback (the callback path is only entered from `transfer`).
+            let kind: u32 = match target.callback {
+                ReentrancyCallback::ReleaseInheritance => 1,
+                ReentrancyCallback::TopUp => 2,
+                ReentrancyCallback::MergeWills => 3,
+                ReentrancyCallback::RevealAndClaim => 4,
+            };
+            let attempts: u32 = env
+                .storage()
+                .instance()
+                .get(&DataKey::CallbackAttempts)
+                .unwrap_or(0);
+            if attempts < MAX_RECORDED_CALLBACK_ATTEMPTS {
+                env.storage()
+                    .instance()
+                    .set(&DataKey::CallbackAttempts, &(attempts + 1));
+            }
+            env.storage()
+                .instance()
+                .set(&DataKey::LastCallbackKind, &kind);
+
+            let outcome = match target.callback {
                 ReentrancyCallback::ReleaseInheritance => {
                     // Attempt to reenter mid-transfer. `distribute` commits
                     // `will.status = Released` before this transfer fires, so a
                     // second attempt is rejected with `WillNotTriggered` instead of
                     // paying out twice.
-                    let _ = will_client.try_release_inheritance(&target.will_id, &None);
+                    classify(will_client.try_release_inheritance(&target.will_id, &None))
                 }
                 ReentrancyCallback::TopUp => {
                     // Attempt a second top_up inside the first top_up's transfer.
                     // The will's balance is already updated before the external
                     // transfer fires (checks-effects-interactions), so the reentrant
                     // call sees the post-first-top-up balance and must not corrupt it.
-                    let _ = will_client.try_top_up(
+                    classify(will_client.try_top_up(
                         &target.will_id,
                         &target.owner,
                         &target.token,
                         &target.amount,
-                    );
+                    ))
                 }
                 ReentrancyCallback::MergeWills => {
                     // Attempt to merge mid-transfer. Effects are already committed
                     // before the external transfer fires, so the merge attempt should
                     // either succeed on a still-valid state or be rejected outright
                     // by status/ownership checks, never leaving state inconsistent.
-                    let _ = will_client.try_merge_wills(
+                    classify(will_client.try_merge_wills(
                         &target.owner,
                         &target.will_id,
                         &target.will_id_b,
-                    );
+                    ))
                 }
                 ReentrancyCallback::RevealAndClaim => {
                     // Attempt a second reveal_and_claim mid-transfer. The slot is
                     // already marked claimed and the balance already deducted before
                     // the transfer fires, so the reentrant attempt must fail with
                     // `AlreadyClaimed` rather than paying out twice.
-                    let _ = will_client.try_reveal_and_claim(
+                    classify(will_client.try_reveal_and_claim(
                         &target.will_id,
                         &target.claimant,
                         &target.preimage,
-                    );
+                    ))
                 }
-            }
+            };
+
+            env.storage()
+                .instance()
+                .set(&DataKey::LastCallbackResult, &outcome);
         }
+    }
+}
+
+/// Normalizes a `try_*` result into a `CallbackOutcome`.
+///
+/// `Ok(_)` means the contract ran and succeeded; `Err(Ok(_))` means the
+/// contract ran and returned a declared error; `Err(Err(_))` means the host
+/// rejected the invocation before the contract entrypoint executed.
+fn classify<T, E>(
+    result: Result<Result<T, E>, Result<soroban_sdk::InvokeError, soroban_sdk::error::Error>>,
+) -> CallbackOutcome {
+    match result {
+        Ok(_) => CallbackOutcome::Succeeded,
+        Err(Ok(_)) => CallbackOutcome::ContractError,
+        Err(Err(_)) => CallbackOutcome::HostRejection,
     }
 }
 

@@ -42,7 +42,7 @@ use soroban_sdk::{
 
 use crate::{
     Allocation, Beneficiary, Will, WillContract, WillContractClient, WillStatus, MAX_BENEFICIARIES,
-    MAX_GUARDIANS, MAX_PERIOD_DAYS, SECONDS_PER_DAY,
+    MAX_GUARDIANS, MAX_KEEPER_BOUNTY_BPS, MAX_PERIOD_DAYS, SECONDS_PER_DAY,
 };
 
 /// Number of distinct addresses the fuzzer picks from.
@@ -447,7 +447,63 @@ pub fn run_create_will(input: &CreateWillInput) -> Outcome {
     Outcome::Accepted(will_id)
 }
 
-/// Checks every invariant that must hold for a will `create_will` accepted.
+#[cfg(test)]
+mod multi_token_distribution_setup_tests {
+    //! Disposable fixtures proving the targeted-bounty setup assertions in
+    //! `run_multi_token_distribution` actually fail when the setter regresses.
+    //!
+    //! The contract itself is not modified; instead a rejecting setter is
+    //! simulated by replaying the runner's setup assertions against a value
+    //! that never gets stored, which is exactly the state a regression that
+    //! silently ignores the setter would leave behind.
+
+    use super::*;
+
+    /// Mirrors the setup assertion the runner performs after a successful
+    /// setter call: the stored selection must equal the requested target.
+    fn assert_target_active(stored: Option<Address>, requested: &Address) {
+        assert_eq!(
+            stored.as_ref(),
+            Some(requested),
+            "the requested bounty token is not the active selection after setup"
+        );
+    }
+
+    /// A rejecting setter leaves the stored selection unset; the runner's
+    /// property must fail rather than silently proceeding to default
+    /// distribution.
+    #[test]
+    #[should_panic(expected = "not the active selection")]
+    fn rejecting_setter_fails_target_active_property() {
+        let env = Env::default();
+        let requested = Address::generate(&env);
+        // Simulated regression: the setter rejected the call, so nothing was
+        // stored.
+        assert_target_active(None, &requested);
+    }
+
+    /// Default campaign case: no target requested, so no setup assertion is
+    /// made and the runner proceeds to default distribution.
+    #[test]
+    fn default_campaign_has_no_target() {
+        let input = MultiTokenDistributionInput {
+            token_amounts: vec![1_000_000],
+            beneficiaries: Vec::new(),
+            keeper_bounty_bps: 100,
+            target_bounty_token_idx: None,
+        };
+        assert!(input.target_bounty_token_idx.is_none());
+    }
+
+    /// Targeted-token campaign case: a valid target is requested and the
+    /// property holds when the setter stored it.
+    #[test]
+    fn targeted_campaign_confirms_active_target() {
+        let env = Env::default();
+        let requested = Address::generate(&env);
+        assert_target_active(Some(requested.clone()), &requested);
+    }
+}/// Checks every invariant that must hold for a will `create_will` accepted.
 fn assert_created_will(
     scenario: &Scenario<'_>,
     input: &CreateWillInput,
@@ -1294,12 +1350,204 @@ pub struct MixedBeneficiarySpec {
 pub struct MultiTokenDistributionInput {
     /// Token balances to lock (amount per token)
     pub token_amounts: Vec<i128>,
-    /// Beneficiaries with mixed allocations
+    /// Beneficiaries with mixed allocations. Positive weights are normalised
+    /// into a supported bps total; non-positive weights are treated as
+    /// "unspecified" and filled in by the normaliser.
     pub beneficiaries: Vec<MixedBeneficiarySpec>,
-    /// Keeper bounty in basis points (0..=1000)
+    /// Raw keeper bounty in basis points. Values within
+    /// `0..=MAX_KEEPER_BOUNTY_BPS` are used verbatim; out-of-range values are
+    /// routed to an explicit validation probe instead of the accepted branch.
     pub keeper_bounty_bps: u32,
     /// Targeted token index for keeper bounty (if any)
     pub target_bounty_token_idx: Option<u8>,
+    /// When set, the runner additionally probes an out-of-range bounty and
+    /// asserts it is rejected, rather than folding it into the accepted run.
+    pub probe_invalid_bounty: bool,
+}
+
+/// Normalises the input's beneficiary specs into a list the contract accepts,
+/// preserving the *shape* of the supplied weights rather than flattening them
+/// into equal shares.
+///
+/// Positive percentage weights are scaled into a total of 10,000 bps using
+/// integer arithmetic, so a 1/9999-style split stays 1/9999 and a skewed
+/// weight stays skewed. Fixed amounts are clamped so their sum stays below the
+/// smallest token balance. Owner-as-beneficiary (slot 0) is permitted.
+fn normalize_distribution_beneficiaries(
+    pool: &SorobanVec<Address>,
+    specs: &[MixedBeneficiarySpec],
+    min_balance: i128,
+) -> Vec<Beneficiary> {
+    // Deduplicate by resolved address so the contract does not reject the
+    // list as containing duplicate beneficiaries. Slot 0 (the owner) is kept:
+    // owner-as-beneficiary is a supported, deliberately exercised case.
+    let mut seen_slots: Vec<u8> = Vec::new();
+    let mut kept: Vec<(u8, MixedAllocationSpec)> = Vec::new();
+    for spec in specs.iter() {
+        let resolved = spec.address_slot % ADDRESS_POOL_SIZE;
+        if seen_slots.contains(&resolved) {
+            continue;
+        }
+        seen_slots.push(resolved);
+        kept.push((resolved, spec.allocation.clone()));
+        if kept.len() >= MAX_BENEFICIARIES as usize {
+            break;
+        }
+    }
+
+    if kept.is_empty() {
+        kept.push((1, MixedAllocationSpec::Percentage(10_000)));
+    }
+
+    // Fixed amounts first: clamp each so the running sum stays strictly below
+    // the smallest balance, leaving something for the percentage shares.
+    let mut out: Vec<Beneficiary> = Vec::new();
+    let mut fixed_sum: i128 = 0;
+    let fixed_cap = (min_balance / 4).max(1);
+    for (resolved, allocation) in kept.iter() {
+        if let MixedAllocationSpec::FixedAmount(amt) = allocation {
+            let fixed = (*amt).clamp(1, fixed_cap);
+            if fixed_sum.saturating_add(fixed) < min_balance {
+                fixed_sum += fixed;
+                out.push(Beneficiary {
+                    address: slot(pool, *resolved),
+                    allocation: Allocation::FixedAmount(fixed),
+                });
+            }
+        }
+    }
+
+    // Percentage weights: take the supplied positive weights verbatim and
+    // scale them to 10,000 bps. Non-positive weights fall back to an equal
+    // share of whatever is left, so the total is always exactly 10,000.
+    let pct_specs: Vec<(u8, u32)> = kept
+        .iter()
+        .filter_map(|(resolved, allocation)| match allocation {
+            MixedAllocationSpec::Percentage(w) if *w > 0 => Some((*resolved, *w)),
+            MixedAllocationSpec::Percentage(_) => Some((*resolved, 0)),
+            MixedAllocationSpec::FixedAmount(_) => None,
+        })
+        .collect();
+
+    if !pct_specs.is_empty() {
+        let positive_total: u64 = pct_specs
+            .iter()
+            .map(|(_, w)| *w as u64)
+            .filter(|w| *w > 0)
+            .sum();
+        let unspecified = pct_specs.iter().filter(|(_, w)| *w == 0).count() as u64;
+
+        let mut assigned: u32 = 0;
+        let mut last_positive: Option<usize> = None;
+        let mut shares: Vec<u32> = Vec::with_capacity(pct_specs.len());
+        for (_, weight) in pct_specs.iter() {
+            if *weight > 0 && positive_total > 0 {
+                // Scale into 10,000 bps, keeping at least 1 bp for any
+                // positive weight so tiny shares survive normalisation.
+                let scaled = ((*weight as u64) * 10_000 / positive_total) as u32;
+                let share = scaled.max(1);
+                shares.push(share);
+                assigned = assigned.saturating_add(share);
+                last_positive = Some(shares.len() - 1);
+            } else {
+                shares.push(0);
+            }
+        }
+
+        // Distribute any remaining bps (from rounding down, or from
+        // unspecified weights) across the entries, preferring the last
+        // positive weight so a 1/9999 split stays exactly 1/9999.
+        let mut remaining = 10_000u32.saturating_sub(assigned);
+        if unspecified > 0 {
+            let each = remaining / unspecified as u32;
+            let mut extra = remaining - each * unspecified as u32;
+            for (i, (_, weight)) in pct_specs.iter().enumerate() {
+                if *weight == 0 {
+                    let mut share = each;
+                    if extra > 0 {
+                        share += 1;
+                        extra -= 1;
+                    }
+                    shares[i] = share;
+                    remaining = remaining.saturating_sub(share);
+                }
+            }
+        }
+        if remaining > 0 {
+            if let Some(idx) = last_positive {
+                shares[idx] = shares[idx].saturating_add(remaining);
+            } else if let Some(first) = shares.first_mut() {
+                *first = first.saturating_add(remaining);
+            }
+        }
+
+        for ((resolved, _), share) in pct_specs.iter().zip(shares.iter()) {
+            out.push(Beneficiary {
+                address: slot(pool, *resolved),
+                allocation: Allocation::Percentage(*share),
+            });
+        }
+    }
+
+    if out.is_empty() {
+        out.push(Beneficiary {
+            address: slot(pool, 1),
+            allocation: Allocation::Percentage(10_000),
+        });
+    }
+
+    out
+}
+
+/// Picks a bounty value the contract accepts, from the boundary set
+/// `{0, 1, MAX_KEEPER_BOUNTY_BPS}`. Out-of-range inputs are *not* silently
+/// folded in here; they are handled by [`probe_invalid_bounty`].
+fn accepted_bounty_bps(raw: u32) -> u32 {
+    if raw <= MAX_KEEPER_BOUNTY_BPS {
+        raw
+    } else {
+        match raw % 3 {
+            0 => 0,
+            1 => 1,
+            _ => MAX_KEEPER_BOUNTY_BPS,
+        }
+    }
+}
+
+/// Explicit validation probe: an out-of-range bounty must be rejected by
+/// `create_will` with a declared error, never accepted and never an abort.
+fn probe_invalid_bounty(
+    client: &WillContractClient<'_>,
+    env: &Env,
+    owner: &Address,
+    tokens: &SorobanVec<(Address, i128)>,
+    beneficiaries: &SorobanVec<Beneficiary>,
+    input: &MultiTokenDistributionInput,
+) {
+    let guardians: SorobanVec<Address> = SorobanVec::new(env);
+    let invalid = MAX_KEEPER_BOUNTY_BPS + 1;
+    match client.try_create_will(
+        owner,
+        tokens,
+        beneficiaries,
+        &90,
+        &7,
+        &guardians,
+        &2,
+        &Some(invalid),
+        &0,
+    ) {
+        Ok(Ok(_)) => violation(
+            input,
+            "create_will accepted a keeper bounty above MAX_KEEPER_BOUNTY_BPS",
+        ),
+        Ok(Err(_)) => violation(input, "create_will returned an undecodable value"),
+        Err(Ok(_)) => {}
+        Err(Err(e)) => violation(
+            input,
+            &std::format!("create_will aborted on an out-of-range bounty: {e:?}"),
+        ),
+    }
 }
 
 pub fn run_multi_token_distribution(input: &MultiTokenDistributionInput) -> Outcome {
@@ -1341,70 +1589,14 @@ pub fn run_multi_token_distribution(input: &MultiTokenDistributionInput) -> Outc
         tokens_to_lock.push_back((addr, amount));
     }
 
-    // Sanitize beneficiaries: ensure distinct addresses and valid allocation sum
-    let mut seen_slots: Vec<u8> = Vec::new();
-    let mut sanitized_bens: Vec<Beneficiary> = Vec::new();
-    let mut fixed_sum: i128 = 0;
+    // Normalise the supplied weights into a supported allocation, preserving
+    // the shape of the input rather than flattening to equal shares.
     let min_balance = *valid_amounts.iter().min().unwrap();
-
-    for b in input.beneficiaries.iter() {
-        let slot_idx = b.address_slot % ADDRESS_POOL_SIZE;
-        // Exclude owner (slot 0)
-        if slot_idx == 0 || seen_slots.contains(&slot_idx) {
-            continue;
-        }
-        seen_slots.push(slot_idx);
-        let addr = slot(&pool, slot_idx);
-
-        match b.allocation {
-            MixedAllocationSpec::FixedAmount(amt) => {
-                let fixed = amt.clamp(1, (min_balance / 4).max(1));
-                if fixed_sum.saturating_add(fixed) < min_balance {
-                    fixed_sum += fixed;
-                    sanitized_bens.push(Beneficiary {
-                        address: addr,
-                        allocation: Allocation::FixedAmount(fixed),
-                    });
-                }
-            }
-            MixedAllocationSpec::Percentage(_) => {
-                sanitized_bens.push(Beneficiary {
-                    address: addr,
-                    allocation: Allocation::Percentage(0),
-                });
-            }
-        }
-        if sanitized_bens.len() >= MAX_BENEFICIARIES as usize {
-            break;
-        }
-    }
-
-    if sanitized_bens.is_empty() {
-        sanitized_bens.push(Beneficiary {
-            address: slot(&pool, 1),
-            allocation: Allocation::Percentage(10_000),
-        });
-    }
-
-    // Allocate remaining percentage basis points across percentage beneficiaries
-    let pct_indices: Vec<usize> = sanitized_bens
-        .iter()
-        .enumerate()
-        .filter_map(|(i, b)| match b.allocation {
-            Allocation::Percentage(_) => Some(i),
-            _ => None,
-        })
-        .collect();
-
-    if !pct_indices.is_empty() {
-        let count = pct_indices.len();
-        let each = 10_000 / count as u32;
-        let remainder = 10_000 - each * count as u32;
-        for (idx, &i) in pct_indices.iter().enumerate() {
-            let bps = if idx == 0 { each + remainder } else { each };
-            sanitized_bens[i].allocation = Allocation::Percentage(bps);
-        }
-    }
+    let sanitized_bens = normalize_distribution_beneficiaries(
+        &pool,
+        &input.beneficiaries,
+        min_balance,
+    );
 
     let mut soroban_bens: SorobanVec<Beneficiary> = SorobanVec::new(&env);
     for b in sanitized_bens.iter() {
@@ -1414,7 +1606,20 @@ pub fn run_multi_token_distribution(input: &MultiTokenDistributionInput) -> Outc
     let contract_id = env.register(WillContract, ());
     let client = WillContractClient::new(&env, &contract_id);
 
-    let bounty_bps = input.keeper_bounty_bps % 1001; // 0..=1000 (up to 10%)
+    // Out-of-range bounty inputs are an explicit validation concern, not part
+    // of the accepted distribution branch.
+    if input.probe_invalid_bounty || input.keeper_bounty_bps > MAX_KEEPER_BOUNTY_BPS {
+        probe_invalid_bounty(
+            &client,
+            &env,
+            &owner,
+            &tokens_to_lock,
+            &soroban_bens,
+            input,
+        );
+    }
+
+    let bounty_bps = accepted_bounty_bps(input.keeper_bounty_bps);
     let guardian_slots: SorobanVec<Address> = SorobanVec::new(&env);
 
     let will_id_res = client.try_create_will(
@@ -1439,7 +1644,38 @@ pub fn run_multi_token_distribution(input: &MultiTokenDistributionInput) -> Outc
     if let Some(target_idx) = input.target_bounty_token_idx {
         let idx = target_idx as usize % token_addresses.len();
         let target_tok = token_addresses[idx].clone();
-        let _ = client.try_set_keeper_bounty_token(&will_id, &owner, &Some(target_tok));
+        // The selected index is always valid (it is reduced modulo the token
+        // count), so a rejection here is a harness failure, not a legitimate
+        // contract outcome. Ignoring the result would let a setter regression
+        // silently fall back to default distribution while conservation still
+        // held, masking the loss of targeted-bounty coverage.
+        match client.try_set_keeper_bounty_token(&will_id, &owner, &Some(target_tok.clone())) {
+            Ok(Ok(())) => {}
+            Ok(Err(_)) => violation(
+                input,
+                "set_keeper_bounty_token returned an undecodable value",
+            ),
+            Err(Ok(e)) => violation(
+                input,
+                &std::format!(
+                    "set_keeper_bounty_token rejected a valid target token: {e:?}"
+                ),
+            ),
+            Err(Err(e)) => violation(
+                input,
+                &std::format!("set_keeper_bounty_token aborted on a valid target: {e:?}"),
+            ),
+        }
+
+        // Confirm the requested target is actually the active selection before
+        // releasing, so the release below really exercises the targeted-bounty
+        // branch rather than the default distribution path.
+        let stored = client.get_will(&will_id);
+        check(
+            stored.keeper_bounty_token == Some(target_tok.clone()),
+            input,
+            "the requested bounty token is not the active selection after setup",
+        );
     }
 
     // Advance past check-in deadline

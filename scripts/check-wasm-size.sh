@@ -13,6 +13,24 @@ set -euo pipefail
 repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$repo_root"
 
+# Preflight: fail early with an actionable diagnostic when a required
+# executable is missing, so an unmet local prerequisite is distinguishable
+# from a repository/build regression.
+missing_tools=()
+for tool in cargo stat; do
+  if ! command -v "${tool}" >/dev/null 2>&1; then
+    missing_tools+=("${tool}")
+  fi
+done
+
+if [[ ${#missing_tools[@]} -gt 0 ]]; then
+  for tool in "${missing_tools[@]}"; do
+    echo "ERROR: required executable '${tool}' not found in PATH." >&2
+  done
+  echo "Install the missing tool(s) and re-run scripts/check-wasm-size.sh." >&2
+  exit 127
+fi
+
 # Default budget if not supplied
 MAX_WASM_SIZE_BYTES="${MAX_WASM_SIZE_BYTES:-250000}"
 

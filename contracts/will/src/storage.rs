@@ -246,6 +246,73 @@ pub fn set_total_locked(env: &Env, token: &Address, amount: i128) {
     }
 }
 
+/// Refreshes the TTL of a `TotalLocked(token)` entry if it exists and is non-zero.
+///
+/// # Maintenance Policy
+///
+/// Discrete `TotalLocked(token)` entries are created when their values change (`set_total_locked`,
+/// `adjust_locked_value`). Read-only operations like `check_in` and `get_total_locked` do not
+/// refresh the entry's TTL, so a long-lived will with a stable token balance can see its
+/// aggregate record expire to network archival even though the will itself remains active.
+///
+/// This function implements a **bounded keepalive policy** for active token aggregates:
+///
+/// 1. **During active maintenance** (`check_in`, emergency check-ins): call `refresh_total_locked_ttl`
+///    for every token in the will's balances. This ensures that active wills keep their token
+///    aggregates alive as long as they remain active.
+/// 2. **Zero/inactive aggregates**: if a token's total is zero or the entry does not exist in
+///    persistent storage, the function returns without action. This prevents unnecessary
+///    writes for inactive aggregates.
+/// 3. **Bounded cost**: the function performs a single read + conditional write per token,
+///    linear in the will's token count (capped at `MAX_TOKENS = 10`), so the cost is
+///    constant and does not scale with protocol size.
+///
+/// # Rationale
+///
+/// - Calls during status transitions that **change state** (`create_will`, `top_up`, `cancel_will`,
+///   `release_inheritance`) already refresh TTL via `adjust_locked_value`, so no additional
+///   call is needed there.
+/// - Calls during **read-like operations** (`get_total_locked`, `get_protocol_stats`) do not
+///   refresh; this is intentional (they should be read-only and not pay write overhead).
+/// - Calls during **periodic maintenance** (`check_in`, `emergency_checkin`, any scheduled
+///   refresh operation) should refresh to keep active aggregates current, since the will itself
+///   is demonstrably live at those moments.
+/// - A will that is `Active` or `Triggered` but has never moved its tokens (balances unchanged,
+///   no top-ups, no cancellations) would otherwise have a `TotalLocked` entry that expires
+///   independently of the will, eventually becoming inaccessible (archived on-chain), though
+///   the will's balances and the protocol statistics remain correct at query time.
+pub fn refresh_total_locked_ttl(env: &Env, token: &Address) {
+    let key = DataKey::TotalLocked(token.clone());
+    // Attempt to read the entry from persistent storage. Only refresh TTL if it exists
+    // and is non-zero (zero entries are always removed, not stored).
+    if let Some(amount) = env.storage().persistent().get::<_, i128>(&key) {
+        if amount != 0 {
+            env.storage()
+                .persistent()
+                .extend_ttl(&key, LIFETIME_THRESHOLD, BUMP_AMOUNT);
+        }
+    }
+}
+
+/// Refreshes the TTL of all `TotalLocked(token)` entries for every token in a will's balances.
+///
+/// **Intended usage**: call this during active maintenance operations (e.g. `check_in`,
+/// `emergency_checkin`) to keep an active will's token aggregates alive.
+///
+/// For each token in `balances` whose aggregate entry exists and is non-zero, this function
+/// extends its TTL to `(LIFETIME_THRESHOLD, BUMP_AMOUNT)` without modifying the balance value.
+/// If the entry does not exist or is zero, it is skipped (no write).
+///
+/// # Cost
+///
+/// O(N) in the number of distinct tokens in `balances`, where N <= `MAX_TOKENS` (capped at 10).
+/// Each token requires one persistent read + one conditional extend_ttl operation.
+pub fn refresh_total_locked_ttl_for_balances(env: &Env, balances: &Map<Address, i128>) {
+    for (token, _) in balances.iter() {
+        refresh_total_locked_ttl(env, &token);
+    }
+}
+
 /// Loads the list of tokens with active locked balances.
 pub fn get_protocol_tokens(env: &Env) -> Vec<Address> {
     if let Some(tokens) = env.storage().instance().get(&DataKey::ProtocolTokens) {
@@ -353,19 +420,39 @@ pub fn decrement_active_will_count(env: &Env) {
     }
 }
 
+/// Checked addition for `i128` monetary accumulations (balances, per-token
+/// totals, owner statistics).
+///
+/// Two individually representable `i128` amounts need not have a representable
+/// sum, and release builds enable overflow checks, so a raw `a + b` on
+/// accounting values aborts the whole transaction with an opaque host
+/// arithmetic trap. Every monetary accumulation in the contract routes through
+/// this helper instead, so an unrepresentable sum surfaces as the stable,
+/// documented [`WillError::BalanceOverflow`] error (#246).
+///
+/// Callers must perform the checked add **before** any external transfer or
+/// state write, so a rejected update leaves custody and index state untouched.
+pub fn checked_add_balance(a: i128, b: i128) -> Result<i128, WillError> {
+    a.checked_add(b).ok_or(WillError::BalanceOverflow)
+}
+
 /// Adds or subtracts a token amount from the protocol's locked-balance totals.
 ///
 /// Refactored to operate directly on `DataKey::TotalLocked(Address)` in persistent storage,
 /// eliminating vector scans and instance storage serialization overhead, keeping
 /// per-transaction read/write footprint and gas consumption constant regardless of the
 /// number of distinct tokens used in the protocol.
-pub fn adjust_locked_value(env: &Env, token: &Address, delta: i128) {
+///
+/// The accumulation is checked: an unrepresentable total returns
+/// [`WillError::BalanceOverflow`] before any storage write, so a rejected
+/// adjustment leaves the protocol totals and token index unchanged (#246).
+pub fn adjust_locked_value(env: &Env, token: &Address, delta: i128) -> Result<(), WillError> {
     if delta == 0 {
-        return;
+        return Ok(());
     }
     let key = DataKey::TotalLocked(token.clone());
     let current = get_total_locked(env, token);
-    let next_total = current + delta;
+    let next_total = checked_add_balance(current, delta)?;
     if next_total != 0 {
         env.storage().persistent().set(&key, &next_total);
         env.storage()
@@ -409,18 +496,29 @@ pub fn adjust_locked_value(env: &Env, token: &Address, delta: i128) {
             .instance()
             .set(&DataKey::ProtocolTokens, &updated);
     }
+    Ok(())
 }
 
 /// Applies `sign * amount` to the protocol's locked totals for every entry in
 /// a will's `balances` map. Use `1` when balances enter the contract and `-1`
 /// when they leave it (release, cancellation), so multi-token wills keep the
 /// per-token totals in sync with [`recompute_protocol_stats`].
-pub fn adjust_locked_for_balances(env: &Env, balances: &Map<Address, i128>, sign: i128) {
+///
+/// Returns [`WillError::BalanceOverflow`] if any per-token total would be
+/// unrepresentable; the caller's transaction then rolls back every earlier
+/// adjustment in the same call, so the totals stay consistent (#246).
+pub fn adjust_locked_for_balances(
+    env: &Env,
+    balances: &Map<Address, i128>,
+    sign: i128,
+) -> Result<(), WillError> {
     for (token, amount) in balances.iter() {
         if amount != 0 {
-            adjust_locked_value(env, &token, sign * amount);
+            let delta = checked_add_balance(0, sign * amount)?;
+            adjust_locked_value(env, &token, delta)?;
         }
     }
+    Ok(())
 }
 
 /// Returns `true` when a will in `status` still counts towards
@@ -431,6 +529,16 @@ pub fn is_live_status(status: WillStatus) -> bool {
         WillStatus::PendingConfirmation | WillStatus::Active | WillStatus::Triggered
     )
 }
+
+/// Maximum number of wills a single [`recompute_protocol_stats_chunk`] call
+/// may scan (#242).
+///
+/// Each will in the range costs one persistent-storage read, and Soroban caps
+/// a transaction's ledger read footprint (40 entries) and CPU instructions.
+/// A `batch_size` above this cap is rejected with
+/// [`WillError::InvalidChunkSize`] rather than silently clamped, so an
+/// off-chain audit client cannot believe it scanned more ids than it did.
+pub const MAX_STATS_CHUNK_SIZE: u32 = 20;
 
 /// Reads a `DataKey::Will` entry through the schema-compatible decoder.
 ///
@@ -453,23 +561,40 @@ fn decode_will_entry(env: &Env, id: u64) -> Option<Will> {
     }
 }
 
-/// Recomputes protocol statistics across a bounded range of will IDs: `[start_id, start_id + batch_size)`.
+/// Recomputes protocol statistics across a bounded range of will IDs:
+/// `[start_id, start_id + batch_size)`.
 ///
 /// Returns `(chunk_stats, next_id, is_complete)`:
 /// - `chunk_stats`: live will counts and balance totals accumulated within this range.
 /// - `next_id`: next will ID to query in subsequent chunks.
 /// - `is_complete`: true if `last_id` has been reached.
 ///
+/// # Argument semantics (#242)
+///
+/// - `batch_size` must be in `1..=MAX_STATS_CHUNK_SIZE`. A zero size is
+///   rejected with [`WillError::InvalidChunkSize`] — it can never report a
+///   populated registry as fully scanned — and a size above the cap is
+///   rejected rather than clamped.
+/// - `start_id` is inclusive. `start_id == 0` is treated as `1`, the first
+///   id ever allocated. A `start_id` beyond the last allocated id yields an
+///   empty chunk that reports completion.
+/// - The end id is computed with checked arithmetic and clamped to
+///   `last_id`, so a large `start_id`/`batch_size` pair can never overflow.
+/// - The continuation cursor is `end_id + 1`, computed with checked
+///   arithmetic: at `u64::MAX` the chunk reports completion instead of
+///   wrapping to `0`.
+///
 /// # Transaction limit constraints
 /// Soroban imposes strict per-transaction limits on ledger read footprints (maximum 40
 /// read entries) and CPU instructions. Recomputing across all wills in a single transaction
 /// will exceed the transaction footprint budget once `last_id` exceeds a few dozen wills.
-/// For on-chain execution, callers must use chunked execution with a bounded `batch_size` (e.g. <= 20).
+/// For on-chain execution, callers must use chunked execution with a bounded `batch_size`
+/// (at most [`MAX_STATS_CHUNK_SIZE`]).
 pub fn recompute_protocol_stats_chunk(
     env: &Env,
     start_id: u64,
     batch_size: u32,
-) -> (ProtocolStats, u64, bool) {
+) -> Result<(ProtocolStats, u64, bool), WillError> {
     let last_id: u64 = env
         .storage()
         .instance()
@@ -477,17 +602,24 @@ pub fn recompute_protocol_stats_chunk(
         .unwrap_or(0);
 
     if start_id > last_id || batch_size == 0 {
-        return (
+        return Ok((
             ProtocolStats {
                 active_will_count: 0,
                 total_locked_by_token: Vec::new(env),
             },
             start_id,
             true,
-        );
+        ));
     }
 
-    let end_id = (start_id + batch_size as u64 - 1).min(last_id);
+    // Subtraction-first: `batch_size >= 1`, so `batch_size - 1` cannot
+    // underflow, and the checked add cannot trap on a huge `start_id`.
+    let span = (batch_size as u64) - 1;
+    let end_id = match start_id.checked_add(span) {
+        Some(raw_end) => raw_end.min(last_id),
+        None => last_id,
+    };
+
     let mut active_will_count: u64 = 0;
     let mut totals: Map<Address, i128> = Map::new(env);
     let mut id = start_id;
@@ -498,9 +630,13 @@ pub fn recompute_protocol_stats_chunk(
                 active_will_count += 1;
                 for (token, amount) in will.balances.iter() {
                     let prev = totals.get(token.clone()).unwrap_or(0);
-                    totals.set(token, prev + amount);
+                    let next = checked_add_balance(prev, amount)?;
+                    totals.set(token, next);
                 }
             }
+        }
+        if id == end_id {
+            break;
         }
         id += 1;
     }
@@ -513,17 +649,20 @@ pub fn recompute_protocol_stats_chunk(
         });
     }
 
-    let next_id = end_id + 1;
-    let is_complete = next_id > last_id;
+    // Continuation cursor: completion at `u64::MAX` rather than wrapping.
+    let (next_id, is_complete) = match end_id.checked_add(1) {
+        Some(next) => (next, next > last_id),
+        None => (end_id, true),
+    };
 
-    (
+    Ok((
         ProtocolStats {
             active_will_count,
             total_locked_by_token,
         },
         next_id,
         is_complete,
-    )
+    ))
 }
 
 /// Recomputes protocol statistics from scratch by walking every will id ever
@@ -539,7 +678,7 @@ pub fn recompute_protocol_stats_chunk(
 /// This function is explicitly scoped to **off-chain simulation** (e.g. via RPC `simulateTransaction`)
 /// or local audit helpers. For on-chain execution, use [`recompute_protocol_stats_chunk`] to paginate
 /// through the ID space within the per-transaction budget.
-pub fn recompute_protocol_stats(env: &Env) -> ProtocolStats {
+pub fn recompute_protocol_stats(env: &Env) -> Result<ProtocolStats, WillError> {
     let last_id: u64 = env
         .storage()
         .instance()
@@ -555,7 +694,8 @@ pub fn recompute_protocol_stats(env: &Env) -> ProtocolStats {
                 active_will_count += 1;
                 for (token, amount) in will.balances.iter() {
                     let prev = totals.get(token.clone()).unwrap_or(0);
-                    totals.set(token, prev + amount);
+                    let next = checked_add_balance(prev, amount)?;
+                    totals.set(token, next);
                 }
             }
         }
@@ -582,10 +722,10 @@ pub fn recompute_protocol_stats(env: &Env) -> ProtocolStats {
         });
     }
 
-    ProtocolStats {
+    Ok(ProtocolStats {
         active_will_count,
         total_locked_by_token,
-    }
+    })
 }
 
 /// Compares stored protocol stats against a fresh full-scan recomputation,
@@ -603,7 +743,7 @@ pub fn recompute_protocol_stats(env: &Env) -> ProtocolStats {
 pub fn compare_protocol_stats(
     env: &Env,
     stored: &ProtocolStats,
-) -> (bool, Vec<TokenLockedBalance>, u64) {
+) -> Result<(bool, Vec<TokenLockedBalance>, u64), WillError> {
     let last_id: u64 = env
         .storage()
         .instance()
@@ -621,7 +761,8 @@ pub fn compare_protocol_stats(
                 computed_active += 1;
                 for (token, amount) in will.balances.iter() {
                     let prev = computed_totals.get(token.clone()).unwrap_or(0);
-                    computed_totals.set(token, prev + amount);
+                    let next = checked_add_balance(prev, amount)?;
+                    computed_totals.set(token, next);
                 }
             }
         }
@@ -654,7 +795,7 @@ pub fn compare_protocol_stats(
         }
     }
 
-    (consistent, discrepancies, computed_active)
+    Ok((consistent, discrepancies, computed_active))
 }
 
 /// Persists a will's state, refreshing its storage TTL unless the will has
@@ -694,6 +835,38 @@ pub fn save_will(env: &Env, will: &Will) {
         env.storage()
             .persistent()
             .extend_ttl(&key, LIFETIME_THRESHOLD, BUMP_AMOUNT);
+        // Keep the retained audit trail and its sequence counter alive
+        // alongside the live will (#244). Settings and guardian-consent
+        // changes save the will without appending history, so without this
+        // the trail could lapse while the will itself stays usable.
+        refresh_history_ttl(env, will.id);
+    }
+}
+
+/// Refreshes the TTL of a will's retained `WillHistory` trail and its
+/// `WillHistorySeq` counter together, if they exist (#244).
+///
+/// This is the single retention policy for the audit trail of a live will:
+/// both keys are extended to the same [`BUMP_AMOUNT`] horizon whenever the
+/// will itself is refreshed, so a long-lived estate never needs a separate
+/// restoration step before its history is readable or its next append is
+/// usable. Missing keys are left alone — there is nothing to retain, and
+/// creating them here would fabricate state.
+///
+/// Terminal wills are not refreshed: [`save_will`] skips this for `Released`
+/// and `Cancelled`, and [`archive_will`] removes both keys outright.
+pub fn refresh_history_ttl(env: &Env, will_id: u64) {
+    let history_key = DataKey::WillHistory(will_id);
+    if env.storage().persistent().has(&history_key) {
+        env.storage()
+            .persistent()
+            .extend_ttl(&history_key, LIFETIME_THRESHOLD, BUMP_AMOUNT);
+    }
+    let seq_key = DataKey::WillHistorySeq(will_id);
+    if env.storage().persistent().has(&seq_key) {
+        env.storage()
+            .persistent()
+            .extend_ttl(&seq_key, LIFETIME_THRESHOLD, BUMP_AMOUNT);
     }
 }
 
@@ -1706,12 +1879,38 @@ pub const MAX_PAGE_SIZE: u32 = 50;
 /// any caller that wants it.
 fn next_history_seq(env: &Env, will_id: u64) -> u64 {
     let key = DataKey::WillHistorySeq(will_id);
-    let next: u64 = env.storage().persistent().get(&key).unwrap_or(0) + 1;
+    let stored: u64 = env.storage().persistent().get(&key).unwrap_or(0);
+    // A missing (or lapsed) counter must not silently restart numbering while
+    // retained history already contains larger sequences (#244). Fall back to
+    // the largest seq present in the trail so numbering stays monotonic.
+    let floor = if stored == 0 {
+        max_retained_history_seq(env, will_id)
+    } else {
+        stored
+    };
+    let next = floor.saturating_add(1);
     env.storage().persistent().set(&key, &next);
     env.storage()
         .persistent()
         .extend_ttl(&key, LIFETIME_THRESHOLD, BUMP_AMOUNT);
     next
+}
+
+/// Returns the largest `seq` present in `will_id`'s retained history, or `0`
+/// when the trail is empty or absent.
+fn max_retained_history_seq(env: &Env, will_id: u64) -> u64 {
+    let history: Vec<WillStatusTransition> = env
+        .storage()
+        .persistent()
+        .get(&DataKey::WillHistory(will_id))
+        .unwrap_or_else(|| Vec::new(env));
+    let mut max_seq: u64 = 0;
+    for entry in history.iter() {
+        if entry.seq > max_seq {
+            max_seq = entry.seq;
+        }
+    }
+    max_seq
 }
 
 /// Appends a status transition entry to `will_id`'s on-chain audit trail.
@@ -1756,10 +1955,13 @@ pub fn append_history(env: &Env, will_id: u64, transition: &WillStatusTransition
 /// [`paginate_history`] instead of taking the whole vector.
 pub fn get_history(env: &Env, will_id: u64) -> Vec<WillStatusTransition> {
     let key = DataKey::WillHistory(will_id);
-    env.storage()
-        .persistent()
-        .get(&key)
-        .unwrap_or_else(|| Vec::new(env))
+    let history: Option<Vec<WillStatusTransition>> = env.storage().persistent().get(&key);
+    if history.is_some() {
+        // A read of a live will's trail counts as activity for retention, so
+        // the trail and its counter stay recoverable together (#244).
+        refresh_history_ttl(env, will_id);
+    }
+    history.unwrap_or_else(|| Vec::new(env))
 }
 
 /// Returns a bounded page of `will_id`'s audit trail, oldest-first.

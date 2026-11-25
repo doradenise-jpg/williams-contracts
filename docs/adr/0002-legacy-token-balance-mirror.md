@@ -52,14 +52,22 @@ immediately.
 
 ## Known consequences (the desync risk)
 
+> **Historical note (superseded):** The consequences below describe the
+> state of the code when this ADR was written. Item 1 in particular is no
+> longer accurate — see "Current state correction (2024-06-01)" at the end
+> of this document. The text is preserved here to record the original
+> tradeoff and the risk that motivated later work.
+
 Because `token`/`balance` are a snapshot of *only the first token*, not a
 derived total, they can and do drift from `balances` in ways that are easy
 to misread as "the will's balance":
 
-1. **`reveal_and_claim` never updates `balances`.** It debits `will.balance`
-   only. For a will with more than one locked token, `balances` still shows
-   the pre-claim amount for the primary token after a claim — `will.balance`
-   and `balances.get(will.token)` disagree.
+1. **`reveal_and_claim` never updates `balances`.** *(Historical — no longer
+   true; superseded by multi-token claim delivery, issue #18. See the
+   current-state correction below.)* It debited `will.balance` only. For a
+   will with more than one locked token, `balances` still showed the
+   pre-claim amount for the primary token after a claim — `will.balance`
+   and `balances.get(will.token)` disagreed.
 2. **`merge_wills`' `combined_balance` is not "total value across all
    tokens."** It is `will_a.balance + will_b.balance`, i.e. primary-token
    amounts only, summed. For wills holding multiple tokens, this sum has no
@@ -90,3 +98,54 @@ deprecated and eventually removed from `Will` in a version bump that updates
   fields for single-token wills and off-chain display purposes.
 - Any new entry point that needs a will's true total value must sum
   `balances`, not read `will.balance`.
+
+## Current state correction (2024-06-01)
+
+This section records the current behavior of the code and supersedes the
+historical claims above where they conflict. It is dated so readers can
+distinguish the original architectural account from the present
+implementation.
+
+### `reveal_and_claim` now delivers every token and keeps the mirror in sync
+
+The historical statement that `reveal_and_claim` "never updates `balances`"
+and pays only `will.token` is **obsolete**. `reveal_and_claim` now builds a
+multi-token transfer plan: it iterates the will's `balances` map, computes
+each claimant's share per token, and transfers each token to the claimant.
+It updates the claim map and the legacy `token`/`balance` mirror together,
+so `will.balance` and `balances.get(will.token)` remain consistent after a
+claim. Multi-token claim delivery was introduced in issue #18.
+
+### The actual current mirror invariant
+
+`token`/`balance` is the **primary-token mirror**: `token` is the first
+entry of the `tokens` list and `balance` is derived from
+`balances.get(primary_token)`. It is not an independent snapshot and is not
+a total across tokens. The mirror is kept in sync with `balances` by:
+
+- `create_will` — initializes both from the `tokens` list (rejecting
+  duplicate token addresses with `WillError::DuplicateToken`, #350).
+- `top_up` — increments both the `balances` entry and the mirror when the
+  topped-up token is the primary token.
+- `split_will` — maintains the mirror consistently with the split
+  `balances` map.
+- `reveal_and_claim` — updates the claim map and the mirror together, as
+  described above.
+- `cancel_will` — refunds and decrements locked value for **every** entry
+  in `balances` (#353); it does not depend on the mirror for payouts.
+
+`merge_wills` still keys its headline balance math off the mirror
+(`combined_balance = will_a.balance + will_b.balance`) while separately
+combining the `balances` map, subject to the documented supported merge
+policy. That combined figure is a primary-token arithmetic sum only.
+
+### Numerical sums are not economic value
+
+Summing raw amounts across tokens (whether from `balances` or from the
+mirror) yields only a **numerical total**, not an economic valuation.
+Unlike token units are not commensurable: adding a quantity of token A to a
+quantity of token B produces a meaningless `i128` for any economic
+comparison. Any true total-value computation must sum `balances` per token
+and value each token separately (e.g. via an external price source) before
+combining. The ADR does not, and must not be read to, imply that raw
+cross-token sums form a valuation.

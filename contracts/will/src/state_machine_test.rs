@@ -120,8 +120,55 @@ fn reach_settled(env: &Env, client: &WillContractClient, will_id: u64, owner: &A
     assert_eq!(client.get_will(&will_id).status, WillStatus::Settled);
 }
 
+/// The explicit terminal-state transition model enforced after every probe.
+///
+/// In this no-reserve fixture, simple wills have no hashed liabilities, so no
+/// successful probe may legitimately reduce a terminal will's balance. The
+/// only permitted mutation of a terminal will is `Released → Settled` caused
+/// by `close_will`; every other probe must leave both the status and the
+/// balance map exactly unchanged.
+///
+/// This is checked per step against the immediately preceding snapshot, so a
+/// forbidden intermediate change cannot be hidden by a later operation.
+fn assert_terminal_step_transition(
+    before: &crate::Will,
+    after: &crate::Will,
+    probe: TerminalProbe,
+) {
+    let before_status = before.status;
+    let after_status = after.status;
+
+    // The fundamental invariant: a terminal will must never transition to a
+    // non-terminal state.
+    assert!(
+        matches!(
+            after_status,
+            WillStatus::Released | WillStatus::Cancelled | WillStatus::Settled
+        ),
+        "probe {probe:?} moved terminal will (was {before_status:?}) to non-terminal state {after_status:?}"
+    );
+
+    // The only permitted status change within the terminal set is
+    // Released → Settled, and only via the close operation.
+    let permitted_close_transition = probe == TerminalProbe::CloseWill
+        && before_status == WillStatus::Released
+        && after_status == WillStatus::Settled;
+    assert!(
+        after_status == before_status || permitted_close_transition,
+        "probe {probe:?} performed forbidden terminal transition {before_status:?} -> {after_status:?}"
+    );
+
+    // This fixture has no hashed liabilities, so no probe may alter the
+    // balance map. Any decrease (or increase) is a model violation.
+    assert_eq!(
+        after.balances, before.balances,
+        "probe {probe:?} modified terminal will's balance map ({:?} -> {:?})",
+        before.balances, after.balances
+    );
+}
+
 /// Assert that a will in a terminal state cannot be moved back to a
-/// non-terminal state by any probe, and that its balances are not increased.
+/// non-terminal state by any probe, and that its balances are not modified.
 ///
 /// `Released → Settled` is the one permitted status change across terminal
 /// states: `close_will` moves a Released will to Settled, which is also
@@ -135,7 +182,7 @@ fn assert_terminal_will_is_immutable(
     token_address: &Address,
     sequence: &ProbeSequence,
 ) {
-    let before = client.get_will(&will_id);
+    let mut before = client.get_will(&will_id);
     let initial_terminal_status = before.status;
     assert!(
         matches!(
@@ -179,27 +226,19 @@ fn assert_terminal_will_is_immutable(
 
         let after = client.get_will(&will_id);
 
-        // The fundamental invariant: a terminal will must never transition
-        // to a non-terminal state. Released → Settled is the one allowed
-        // forward transition within the terminal set.
-        assert!(
-            matches!(
-                after.status,
-                WillStatus::Released | WillStatus::Cancelled | WillStatus::Settled
-            ),
-            "probe {probe:?} moved terminal will (was {initial_terminal_status:?}) to non-terminal state {:?}",
-            after.status
-        );
+        // Enforce the explicit per-step transition model against the
+        // immediately preceding snapshot.
+        assert_terminal_step_transition(&before, &after, *probe);
 
-        // Balances must not increase (no funds appeared from nowhere).
-        // They may only decrease (e.g. to zero on release) or stay the same.
-        // We check the specific token used in the test.
+        // The token used in this fixture must never change either.
         let before_bal = before.balances.get(token_address.clone()).unwrap_or(0);
         let after_bal = after.balances.get(token_address.clone()).unwrap_or(0);
-        assert!(
-            after_bal <= before_bal,
-            "probe {probe:?} increased terminal will's balance from {before_bal} to {after_bal}"
+        assert_eq!(
+            after_bal, before_bal,
+            "probe {probe:?} changed terminal will's balance from {before_bal} to {after_bal}"
         );
+
+        before = after;
     }
 }
 
@@ -384,6 +423,83 @@ fn settled_will_rejects_trigger() {
     let result = client.try_trigger_will(&will_id);
     assert!(result.is_err(), "settled will accepted trigger_will");
     assert_eq!(client.get_will(&will_id).status, WillStatus::Settled);
+}
+
+// ---------------------------------------------------------------------------
+// Oracle self-tests: prove the tightened transition model detects violations
+// ---------------------------------------------------------------------------
+
+/// Build a synthetic will snapshot with the given status and token balance.
+fn synthetic_will(
+    env: &Env,
+    token_address: &Address,
+    status: WillStatus,
+    balance: i128,
+) -> crate::Will {
+    let mut balances = soroban_sdk::Map::new(env);
+    balances.set(token_address.clone(), balance);
+    crate::Will {
+        owner: Address::generate(env),
+        balances,
+        beneficiaries: vec![env],
+        checkin_period_days: 90,
+        grace_period_days: 7,
+        last_checkin: 0,
+        emergency_contacts: vec![env],
+        status,
+        guardians: vec![env],
+        guardian_votes: 0,
+        required_guardian_votes: 0,
+        created_at: 0,
+        triggered_at: 0,
+        release_time: 0,
+        cancelled_at: 0,
+        settled_at: 0,
+        total_allocated_bps: 0,
+    }
+}
+
+/// The oracle must reject a synthetic balance decrease on a non-close probe.
+#[test]
+#[should_panic(expected = "modified terminal will's balance map")]
+fn oracle_detects_synthetic_balance_decrease() {
+    let (env, _client, _owner, token_address) = setup();
+    let before = synthetic_will(&env, &token_address, WillStatus::Released, 500_000);
+    let after = synthetic_will(&env, &token_address, WillStatus::Released, 400_000);
+
+    assert_terminal_step_transition(&before, &after, TerminalProbe::CheckIn);
+}
+
+/// The oracle must reject a synthetic Cancelled → Released transition.
+#[test]
+#[should_panic(expected = "forbidden terminal transition")]
+fn oracle_detects_forbidden_cancelled_to_released() {
+    let (env, _client, _owner, token_address) = setup();
+    let before = synthetic_will(&env, &token_address, WillStatus::Cancelled, 500_000);
+    let after = synthetic_will(&env, &token_address, WillStatus::Released, 500_000);
+
+    assert_terminal_step_transition(&before, &after, TerminalProbe::CancelWill);
+}
+
+/// The oracle must reject a Released → Settled transition on a non-close probe.
+#[test]
+#[should_panic(expected = "forbidden terminal transition")]
+fn oracle_detects_settle_without_close() {
+    let (env, _client, _owner, token_address) = setup();
+    let before = synthetic_will(&env, &token_address, WillStatus::Released, 500_000);
+    let after = synthetic_will(&env, &token_address, WillStatus::Settled, 500_000);
+
+    assert_terminal_step_transition(&before, &after, TerminalProbe::CheckIn);
+}
+
+/// The oracle must accept the legitimate Released → Settled close transition.
+#[test]
+fn oracle_accepts_legitimate_close_transition() {
+    let (env, _client, _owner, token_address) = setup();
+    let before = synthetic_will(&env, &token_address, WillStatus::Released, 500_000);
+    let after = synthetic_will(&env, &token_address, WillStatus::Settled, 500_000);
+
+    assert_terminal_step_transition(&before, &after, TerminalProbe::CloseWill);
 }
 
 /// A terminal will must not change balance after an update_beneficiaries

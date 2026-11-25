@@ -44,6 +44,20 @@
 # contract ID, the network, an ISO-8601 deployment timestamp, and the SHA-256
 # hash of the deployed WASM bytecode so the artifact can be verified against
 # the current release build.
+#
+# Provenance (#285): the artifact also records a nested `provenance` object
+# identifying the source revision (git HEAD), whether the worktree was dirty,
+# the pinned tool identifiers (rustc/cargo/stellar-cli versions and the
+# wasm32v1-none target) and the canonical build invocation. A hash alone does
+# not tell a reviewer which source state produced it; this record does. Dirty
+# builds are explicitly marked (dirty: true plus a dirtyDisclosure string)
+# rather than being presented as the clean revision. No secrets, private keys
+# or environment variables beyond the already-recorded identity name are
+# serialized.
+#
+# Testing: `./scripts/deploy-testnet.sh --emit-provenance-only` writes just the
+# provenance record (no build, no deploy) so tests can exercise it in clean and
+# dirty temporary git trees.
 
 set -euo pipefail
 
@@ -74,6 +88,107 @@ WASM_PATH="target/wasm32v1-none/release/will.wasm"
 # can never silently overwrite deployments/testnet.json.
 OUTPUT_FILE="${OUTPUT_FILE:-deployments/${NETWORK}.json}"
 LIB_RS="contracts/will/src/lib.rs"
+# The canonical build invocation. Recorded verbatim in the provenance record so
+# a reviewer can reproduce the artifact under the same pinned settings.
+BUILD_COMMAND="cargo build --package will --release --target wasm32v1-none"
+WASM_TARGET="wasm32v1-none"
+
+# --emit-provenance-only: write just the provenance record (no build, no
+# deploy) so tests can generate it in clean/dirty temporary git trees.
+EMIT_PROVENANCE_ONLY=0
+for arg in "$@"; do
+  case "$arg" in
+    --emit-provenance-only) EMIT_PROVENANCE_ONLY=1 ;;
+    *)
+      echo "error: unknown argument '$arg'" >&2
+      exit 1
+      ;;
+  esac
+done
+
+# JSON-escape a string for safe embedding in the artifact. Only quotes and
+# backslashes need escaping for the values we record (versions, paths, commit
+# hashes); control characters are stripped defensively.
+json_escape() {
+  local s="$1"
+  s="${s//\\/\\\\}"
+  s="${s//\"/\\\"}"
+  s="${s//$'\n'/ }"
+  s="${s//$'\r'/ }"
+  s="${s//$'\t'/ }"
+  printf '%s' "$s"
+}
+
+# Capture the source revision and dirty state. Fails loudly if this is not a
+# git worktree, since provenance without a revision is meaningless.
+capture_git_provenance() {
+  if ! command -v git >/dev/null 2>&1; then
+    echo "error: git not found on PATH; cannot record source provenance" >&2
+    exit 1
+  fi
+  if ! git rev-parse --is-inside-work-tree >/dev/null 2>&1; then
+    echo "error: not inside a git worktree; cannot record source provenance" >&2
+    exit 1
+  fi
+  GIT_REVISION="$(git rev-parse HEAD)"
+  if [[ -n "$(git status --porcelain)" ]]; then
+    GIT_DIRTY=true
+    GIT_DIRTY_DISCLOSURE="worktree had uncommitted changes at build time; this artifact does NOT correspond to clean revision ${GIT_REVISION}"
+    echo "warning: git worktree is dirty -- the recorded revision ${GIT_REVISION} does not fully describe the built source" >&2
+  else
+    GIT_DIRTY=false
+    GIT_DIRTY_DISCLOSURE=""
+  fi
+}
+
+# Capture pinned tool identifiers. Missing tools are recorded as "unknown"
+# rather than aborting, so the record is still emitted for review.
+capture_tool_provenance() {
+  if command -v rustc >/dev/null 2>&1; then
+    RUSTC_VERSION="$(rustc --version)"
+  else
+    RUSTC_VERSION="unknown"
+  fi
+  if command -v cargo >/dev/null 2>&1; then
+    CARGO_VERSION="$(cargo --version)"
+  else
+    CARGO_VERSION="unknown"
+  fi
+  if command -v stellar >/dev/null 2>&1; then
+    STELLAR_CLI_VERSION="$(stellar --version 2>/dev/null | head -n1)"
+  else
+    STELLAR_CLI_VERSION="unknown"
+  fi
+}
+
+# Emit the provenance JSON object (without surrounding braces) to stdout.
+emit_provenance_fields() {
+  local wasm_hash="${1:-}"
+  printf '    "revision": "%s",\n' "$(json_escape "$GIT_REVISION")"
+  printf '    "dirty": %s,\n' "$GIT_DIRTY"
+  printf '    "dirtyDisclosure": "%s",\n' "$(json_escape "$GIT_DIRTY_DISCLOSURE")"
+  printf '    "rustcVersion": "%s",\n' "$(json_escape "$RUSTC_VERSION")"
+  printf '    "cargoVersion": "%s",\n' "$(json_escape "$CARGO_VERSION")"
+  printf '    "stellarCliVersion": "%s",\n' "$(json_escape "$STELLAR_CLI_VERSION")"
+  printf '    "wasmTarget": "%s",\n' "$(json_escape "$WASM_TARGET")"
+  printf '    "buildCommand": "%s",\n' "$(json_escape "$BUILD_COMMAND")"
+  printf '    "wasmHash": "%s"\n' "$(json_escape "$wasm_hash")"
+}
+
+if [[ "$EMIT_PROVENANCE_ONLY" == "1" ]]; then
+  capture_git_provenance
+  capture_tool_provenance
+  mkdir -p "$(dirname "$OUTPUT_FILE")"
+  {
+    printf '{\n'
+    printf '  "provenance": {\n'
+    emit_provenance_fields "${WASM_HASH:-}"
+    printf '  }\n'
+    printf '}\n'
+  } > "$OUTPUT_FILE"
+  echo "==> Wrote provenance-only record to $OUTPUT_FILE"
+  exit 0
+fi
 
 # Guard against an explicit OUTPUT_FILE that would clobber the testnet record
 # from a non-testnet run.
@@ -88,6 +203,10 @@ command -v stellar >/dev/null 2>&1 || {
   echo "  cargo install --locked stellar-cli" >&2
   exit 1
 }
+
+echo "==> Capturing source and build provenance"
+capture_git_provenance
+capture_tool_provenance
 
 echo "==> Checking CONTRACT_VERSION is consistent with Cargo.toml before building"
 "$ROOT_DIR/.github/scripts/check-contract-version.sh"
@@ -174,16 +293,19 @@ fi
 echo "==> OK: deployed bytecode hash matches local WASM SHA-256"
 
 mkdir -p "$(dirname "$OUTPUT_FILE")"
-cat > "$OUTPUT_FILE" <<JSON
 {
-  "WillContract": "$CONTRACT_ID",
-  "network": "$NETWORK",
-  "rpcUrl": "$RPC_URL",
-  "identity": "$DEPLOY_IDENTITY",
-  "deployedAt": "$DEPLOYED_AT",
-  "wasmHash": "$WASM_HASH"
-}
-JSON
+  printf '{\n'
+  printf '  "WillContract": "%s",\n' "$(json_escape "$CONTRACT_ID")"
+  printf '  "network": "%s",\n' "$(json_escape "$NETWORK")"
+  printf '  "rpcUrl": "%s",\n' "$(json_escape "$RPC_URL")"
+  printf '  "identity": "%s",\n' "$(json_escape "$DEPLOY_IDENTITY")"
+  printf '  "deployedAt": "%s",\n' "$(json_escape "$DEPLOYED_AT")"
+  printf '  "wasmHash": "%s",\n' "$(json_escape "$WASM_HASH")"
+  printf '  "provenance": {\n'
+  emit_provenance_fields "$WASM_HASH"
+  printf '  }\n'
+  printf '}\n'
+} > "$OUTPUT_FILE"
 
 echo "==> Wrote $OUTPUT_FILE"
 echo

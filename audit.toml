@@ -6,6 +6,16 @@
 # .cargo/audit.toml or the user cargo directory), which could silently pick up
 # unrelated machine-level settings or ignore this repository configuration.
 #
+# Shared warning policy: CI and the justfile `audit` recipe use the SAME
+# pass/fail policy — warnings (informational and yanked-dependency warnings)
+# do NOT fail the run; only actual vulnerabilities do. This keeps the
+# documented local equivalent aligned with CI.
+#
+# Stricter mode: the justfile `audit-strict` recipe is the explicitly named
+# stricter mode. It loads this same configuration but adds `--deny warnings`,
+# so warnings fail the run. Use it when you want a stricter local check; it is
+# NOT the advertised equivalent of CI.
+#
 # Advisories that have been triaged and judged not to apply to this crate's
 # usage can be allow-listed here. Every entry MUST carry a comment explaining
 # why it's safe to ignore and, ideally, a link to the tracking issue for the

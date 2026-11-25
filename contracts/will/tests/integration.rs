@@ -5,9 +5,11 @@
 //!
 //! This is `#[ignore]`-gated because it requires `stellar`, `docker`, and
 //! network access to spin up a local standalone network, none of which are
-//! available (or desirable) in the fast unit-test CI job. It is run
-//! separately via `scripts/integration_test.sh` and a dedicated CI job.
-//! See CONTRIBUTING.md for how to run it locally.
+//! available (or desirable) in the fast unit-test CI job. Ordinary
+//! `cargo test` therefore skips it; the dedicated lifecycle CI job in
+//! `.github/workflows/scripts-check.yml` runs `scripts/integration_test.sh`
+//! directly against an isolated local network and fails on any lifecycle
+//! error. See CONTRIBUTING.md for how to run it locally.
 
 use std::path::PathBuf;
 use std::process::Command;

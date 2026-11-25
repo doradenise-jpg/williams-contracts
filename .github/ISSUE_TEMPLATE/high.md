@@ -1,7 +1,7 @@
 ---
 name: "High Complexity Task"
 about: Complex features requiring deep knowledge — 200 points
-labels: "complexity: high"
+labels: "enhancement"
 assignees: ''
 ---
 

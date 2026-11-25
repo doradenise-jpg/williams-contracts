@@ -1,7 +1,7 @@
 ---
 name: "Medium Task"
 about: Standard features or bug fixes — 150 points
-labels: "complexity: medium"
+labels: "enhancement"
 assignees: ''
 ---
 

@@ -22,7 +22,7 @@ use soroban_sdk::{
 };
 
 use crate::{
-    test_support::{MaliciousToken, MaliciousTokenClient},
+    test_support::{CallbackOutcome, MaliciousToken, MaliciousTokenClient},
     Allocation, Beneficiary, WillContract, WillContractClient, WillStatus, PREIMAGE_ADDRESS_LENGTH,
     PREIMAGE_LENGTH,
 };
@@ -121,8 +121,22 @@ fn reentrant_top_up_does_not_double_credit_balance() {
     // each top_up must be reflected exactly once in the will's balance.
     will_client.top_up(&will_id, &owner, &token_id, &1_000_000);
 
-    // Disarm before reading state.
-    // (No disarm API needed; the callback only fires during `transfer`.)
+    // The harness must record that the intended callback was actually
+    // attempted exactly once.  A passing balance assertion alone does not
+    // prove the callback reached the contract.
+    assert_eq!(
+        token_client.callback_attempt_count(),
+        1,
+        "the top_up reentrancy callback must be attempted exactly once"
+    );
+    let outcome = token_client.callback_outcome();
+    assert!(
+        matches!(
+            outcome,
+            CallbackOutcome::ContractError(_) | CallbackOutcome::Succeeded
+        ),
+        "the reentrant top_up must reach the contract (success or declared error), got {outcome:?}"
+    );
 
     let will = will_client.get_will(&will_id);
     // The will was created with 1_000_000, topped up with 1_000_000 (outer),
@@ -213,6 +227,19 @@ fn reentrant_top_up_on_triggered_will_is_rejected() {
     // (try_top_up returns Err) without panicking the outer call.
     will_client.top_up(&active_will_id, &owner, &token_id, &500_000);
 
+    // The intended callback must have been attempted, and the rejection must
+    // be a declared contract error (WillNotActive), not a host-level failure.
+    assert_eq!(
+        token_client.callback_attempt_count(),
+        1,
+        "the top_up reentrancy callback must be attempted exactly once"
+    );
+    assert_eq!(
+        token_client.callback_outcome(),
+        CallbackOutcome::ContractError(WillError::WillNotActive as u32),
+        "reentrant top_up on a triggered will must be rejected by the contract, not the host"
+    );
+
     // Active will got exactly one top_up credit.
     let active_will = will_client.get_will(&active_will_id);
     assert_eq!(
@@ -297,6 +324,13 @@ fn reentrant_merge_wills_is_rejected_after_first_merge_completes() {
     // Top up will_id_a with the malicious token to trigger the reentrant merge.
     // The merge fires inside the top_up transfer.
     will_client.top_up(&will_id_a, &owner, &token_id, &1_000_000);
+
+    // The intended callback must have been attempted exactly once.
+    assert_eq!(
+        token_client.callback_attempt_count(),
+        1,
+        "the merge reentrancy callback must be attempted exactly once"
+    );
 
     // The reentrant merge attempt may succeed (merge fires after top_up effects
     // are committed) or be rejected for other reasons — but it must never
@@ -393,6 +427,19 @@ fn reentrant_reveal_and_claim_cannot_double_pay() {
     // The first reveal_and_claim must succeed and pay out exactly once.
     will_client.reveal_and_claim(&will_id, &secret_beneficiary, &preimage);
 
+    // The intended callback must have been attempted, and the reentrant claim
+    // must be rejected by the contract (AlreadyClaimed), not the host.
+    assert_eq!(
+        token_client.callback_attempt_count(),
+        1,
+        "the reveal_and_claim reentrancy callback must be attempted exactly once"
+    );
+    assert_eq!(
+        token_client.callback_outcome(),
+        CallbackOutcome::ContractError(WillError::AlreadyClaimed as u32),
+        "reentrant reveal_and_claim must be rejected by the contract, not the host"
+    );
+
     // The hashed beneficiary received exactly one payout; the reentrant
     // attempt returned `AlreadyClaimed` without a second transfer.
     let claimed_balance = token_client.balance(&secret_beneficiary);
@@ -481,6 +528,19 @@ fn reentrant_reveal_and_claim_cannot_claim_already_claimed_slot() {
     // First claim succeeds.
     will_client.reveal_and_claim(&will_id, &hashed_claimant, &preimage);
 
+    // The intended callback must have been attempted and rejected by the
+    // contract with AlreadyClaimed.
+    assert_eq!(
+        token_client.callback_attempt_count(),
+        1,
+        "the reveal_and_claim reentrancy callback must be attempted exactly once"
+    );
+    assert_eq!(
+        token_client.callback_outcome(),
+        CallbackOutcome::ContractError(WillError::AlreadyClaimed as u32),
+        "reentrant reveal_and_claim must be rejected by the contract, not the host"
+    );
+
     // Slot is marked claimed.
     let will = will_client.get_will(&will_id);
     assert!(
@@ -490,10 +550,142 @@ fn reentrant_reveal_and_claim_cannot_claim_already_claimed_slot() {
 
     // A direct second attempt (outside the reentrancy callback) must also
     // fail with AlreadyClaimed, confirming the state machine is correct.
-    use crate::WillError;
     assert_eq!(
         will_client.try_reveal_and_claim(&will_id, &hashed_claimant, &preimage),
         Err(Ok(WillError::AlreadyClaimed.into())),
         "duplicate reveal_and_claim must return AlreadyClaimed"
+    );
+}
+
+// ── harness bookkeeping controls ─────────────────────────────────────────────
+
+/// Issue #248: With the callback disarmed, no callback attempt is recorded.
+///
+/// This is the disarmed control for the armed tests above: it proves the
+/// bookkeeping only counts callbacks that were actually configured, so a
+/// zero count is meaningful evidence that the harness did not fire.
+#[test]
+fn disarmed_token_records_no_callback_attempt() {
+    let (env, will_client, token_client) = setup_env();
+    let token_id = token_client.address.clone();
+
+    let owner = soroban_sdk::Address::generate(&env);
+    let beneficiary = soroban_sdk::Address::generate(&env);
+
+    token_client.mint(&owner, &2_000_000);
+
+    let will_id = will_client.create_will(
+        &owner,
+        &vec![&env, (token_id.clone(), 1_000_000_i128)],
+        &vec![
+            &env,
+            Beneficiary {
+                address: beneficiary.clone(),
+                allocation: Allocation::Percentage(10_000),
+            },
+        ],
+        &90,
+        &7,
+        &vec![&env],
+        &0,
+        &None,
+        &0,
+    );
+
+    // No reentrancy configured: the transfer must not attempt any callback.
+    will_client.top_up(&will_id, &owner, &token_id, &1_000_000);
+
+    assert_eq!(
+        token_client.callback_attempt_count(),
+        0,
+        "a disarmed token must not record any callback attempt"
+    );
+    assert_eq!(
+        token_client.callback_outcome(),
+        CallbackOutcome::NotAttempted,
+        "a disarmed token must report NotAttempted"
+    );
+
+    // Bookkeeping must not alter balances.
+    let will = will_client.get_will(&will_id);
+    assert_eq!(
+        will.balances.get(token_id.clone()).unwrap_or(0),
+        2_000_000,
+        "bookkeeping must not alter the will balance"
+    );
+    assert_eq!(
+        token_client.balance(&owner),
+        0,
+        "bookkeeping must not alter the owner balance"
+    );
+}
+
+/// Issue #248: A deliberately wrong callback target is diagnosed differently
+/// from the expected attempted callback.
+///
+/// Here the token is armed to call `top_up` on a will id that does not exist.
+/// The callback is still attempted (count == 1), but the contract rejects it
+/// with `WillNotFound` rather than the `WillNotActive` the correct target
+/// would produce. This proves the diagnostics distinguish callback selection.
+#[test]
+fn wrong_callback_target_is_diagnosed_differently() {
+    let (env, will_client, token_client) = setup_env();
+    let token_id = token_client.address.clone();
+    let will_contract_id = will_client.address.clone();
+
+    let owner = soroban_sdk::Address::generate(&env);
+    let beneficiary = soroban_sdk::Address::generate(&env);
+
+    token_client.mint(&owner, &2_000_000);
+
+    let will_id = will_client.create_will(
+        &owner,
+        &vec![&env, (token_id.clone(), 1_000_000_i128)],
+        &vec![
+            &env,
+            Beneficiary {
+                address: beneficiary.clone(),
+                allocation: Allocation::Percentage(10_000),
+            },
+        ],
+        &90,
+        &7,
+        &vec![&env],
+        &0,
+        &None,
+        &0,
+    );
+
+    // Arm the callback against a will id that was never created.
+    let bogus_will_id = will_id + 999;
+    token_client.set_top_up_reentrancy(
+        &will_contract_id,
+        &bogus_will_id,
+        &owner,
+        &token_id,
+        &500_000_i128,
+    );
+
+    will_client.top_up(&will_id, &owner, &token_id, &500_000);
+
+    // The callback was attempted, but the outcome must be the contract error
+    // for the wrong target — not the outcome the correct target produces.
+    assert_eq!(
+        token_client.callback_attempt_count(),
+        1,
+        "the callback must be attempted even for a wrong target"
+    );
+    assert_eq!(
+        token_client.callback_outcome(),
+        CallbackOutcome::ContractError(WillError::WillNotFound as u32),
+        "a wrong callback target must be diagnosed as WillNotFound, not WillNotActive"
+    );
+
+    // The legitimate top_up is unaffected.
+    let will = will_client.get_will(&will_id);
+    assert_eq!(
+        will.balances.get(token_id).unwrap_or(0),
+        1_500_000,
+        "the legitimate top_up must be credited exactly once"
     );
 }

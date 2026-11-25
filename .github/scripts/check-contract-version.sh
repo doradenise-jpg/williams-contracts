@@ -61,18 +61,62 @@ if [[ "$decoded_version" != "$cargo_version" ]]; then
   status=1
 fi
 
-# --- If HEAD is exactly a git tag, it must match too ------------------------
+# --- If HEAD carries a release tag, it must match too ----------------------
+#
+# Only tags following the repository release-tag convention (an optional `v`
+# prefix followed by a strict `MAJOR.MINOR.PATCH` semantic version) are treated
+# as version assertions (#262). Ordinary nonrelease annotations (e.g.
+# `deploy-testnet-2024-01-01`, `nightly`) are ignored so they cannot
+# accidentally block local deployment/version validation.
+#
+# If several matching release tags point at HEAD, the selection is
+# deterministic: the tags are sorted and the highest semantic version is
+# chosen. If the matching tags disagree on the version, the check fails with a
+# clear message rather than silently picking one.
 
-git_tag="$(git -C "$repo_root" describe --tags --exact-match 2>/dev/null || true)"
-if [[ -n "$git_tag" ]]; then
-  tag_version="${git_tag#v}"
-  echo "git tag:                        $git_tag -> $tag_version"
-  if [[ "$tag_version" != "$decoded_version" ]]; then
-    echo "::error::git tag '$git_tag' does not match CONTRACT_VERSION's decoded form '$decoded_version'"
-    status=1
+release_tag_re='^v?[0-9]+\.[0-9]+\.[0-9]+$'
+
+head_tags="$(git -C "$repo_root" tag --points-at HEAD 2>/dev/null || true)"
+release_tags=()
+while IFS= read -r candidate_tag; do
+  [[ -z "$candidate_tag" ]] && continue
+  if [[ "$candidate_tag" =~ $release_tag_re ]]; then
+    release_tags+=("$candidate_tag")
+  fi
+done <<< "$head_tags"
+
+if [[ "${#release_tags[@]}" -eq 0 ]]; then
+  if [[ -n "$head_tags" ]]; then
+    echo "git tag:                        (HEAD has no release tag, skipping tag check)"
+  else
+    echo "git tag:                        (HEAD is not tagged, skipping tag check)"
   fi
 else
-  echo "git tag:                        (HEAD is not tagged, skipping tag check)"
+  # Deterministic ordering: sort by semantic version (numeric fields), then
+  # by tag name as a tie-breaker, and select the highest.
+  sorted_release_tags="$(printf '%s\n' "${release_tags[@]}" | sort -t. -k1,1V -k2,2n -k3,3n -k4,4)"
+  selected_tag="$(printf '%s\n' "$sorted_release_tags" | tail -n 1)"
+  selected_version="${selected_tag#v}"
+
+  # Every matching release tag must agree on the version.
+  tag_versions=()
+  for candidate_tag in "${release_tags[@]}"; do
+    tag_versions+=("${candidate_tag#v}")
+  done
+  unique_versions="$(printf '%s\n' "${tag_versions[@]}" | sort -u)"
+
+  echo "git tag:                        $selected_tag -> $selected_version"
+  if [[ "${#release_tags[@]}" -gt 1 ]]; then
+    echo "git tags on HEAD:               ${release_tags[*]}"
+  fi
+
+  if [[ "$(printf '%s\n' "$unique_versions" | wc -l)" -gt 1 ]]; then
+    echo "::error::multiple release tags on HEAD disagree on the version: ${release_tags[*]}"
+    status=1
+  elif [[ "$selected_version" != "$decoded_version" ]]; then
+    echo "::error::git tag '$selected_tag' does not match CONTRACT_VERSION's decoded form '$decoded_version'"
+    status=1
+  fi
 fi
 
 if [[ "$status" -eq 0 ]]; then

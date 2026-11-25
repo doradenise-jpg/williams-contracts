@@ -30,13 +30,45 @@ For example: `feat/42-guardian-quorum-check` or `fix/17-checkin-deadline-roundin
   event/error schema change, etc.), add an entry under `[Unreleased]` in
   [CHANGELOG.md](./CHANGELOG.md) describing it in the "Added" / "Changed" /
   "Fixed" section that fits. Pure docs/tooling/test-only PRs don't need one.
+  A rustdoc-only edit to an entry point or type (prose, examples, wording)
+  counts as a pure docs change for this rule — see
+  [ABI compatibility policy](#abi-compatibility-policy).
 - If your PR adds a new `WillError` variant, add a row for it to the
   [error code table in the README](./README.md#error-codes) in the same PR —
   don't let the table and `contracts/will/src/errors.rs` drift apart.
 - If your PR changes a public entry-point signature or a shared type
   (`Will`, `Beneficiary`, `Guardian`, `WillStatus`, `WillError`, ...), bump
   the crate `version` in `contracts/will/Cargo.toml` and regenerate the
-  contract spec artifact — see [spec/README.md](./spec/README.md).
+  contract spec artifact — see [spec/README.md](./spec/README.md). "Signature"
+  here means the structural ABI: parameter names, types and order, return
+  types, and the shape of shared types. It does **not** include rustdoc text;
+  see [ABI compatibility policy](#abi-compatibility-policy).
+
+## ABI compatibility policy
+
+The contract spec artifact (`contracts/will/src/fixtures/create_will_spec.txt`,
+compared byte-for-byte by `contracts/will/src/test_xdr_spec.rs`) embeds both
+the structural signature and the rustdoc bytes of each entry point. The
+fixture guard therefore distinguishes two kinds of drift, and reviewers must
+classify a fixture diff as one of them:
+
+- **Structural ABI drift** — any change to a parameter name, parameter type,
+  parameter order, return type, or the shape of a shared type. This is an
+  interface change: bump the crate `version` in `contracts/will/Cargo.toml`,
+  bump `CONTRACT_VERSION` if behavior changes, and regenerate the spec
+  artifact. It requires interface coordination with integrators.
+- **Documentation drift** — a prose-only rustdoc edit that leaves every
+  structural field identical. This is a documentation artifact update: it
+  regenerates the spec fixture (so the diff stays visible in review) but does
+  **not** require a version bump, a CHANGELOG entry, or interface
+  coordination. It falls under the "Pure docs/tooling/test-only" exemption
+  above.
+
+When a PR touches rustdoc on an entry point, state in the PR description that
+the fixture change is documentation-only, and confirm the structural fields
+are unchanged. The XDR spec test asserts this distinction: fixtures that
+differ only in docs pass the structural guard, while a change to a parameter
+name, type or order fails it.
 
 ## Contract versioning
 
@@ -129,6 +161,8 @@ since `migrate_will` is opt-in.
 
 ## Before opening a PR
 
+<a id="before-opening-a-pr"></a>
+
 Run every command used by the [Test CI workflow](./.github/workflows/test.yml) and confirm it succeeds:
 
 - [ ] `cargo fmt --all -- --check`
@@ -139,6 +173,8 @@ Run every command used by the [Test CI workflow](./.github/workflows/test.yml) a
 - [ ] Confirm the Test workflow is green on the PR.
 
 ## Local setup
+
+<a id="local-setup"></a>
 
 See the [README](./README.md#local-setup) for toolchain installation and how to run the test suite.
 

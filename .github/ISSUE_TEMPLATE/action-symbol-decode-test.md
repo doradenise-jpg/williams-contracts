@@ -1,7 +1,7 @@
 ---
 name: Action symbol decode test
 about: Add a table-driven test that asserts every record_transition action symbol decodes to its expected canonical string
-labels: testing, medium
+labels: "enhancement"
 ---
 
 ## Summary

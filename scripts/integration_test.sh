@@ -34,6 +34,27 @@ log() {
   printf '\n\033[1;34m[integration]\033[0m %s\n' "$1"
 }
 
+# Log a lifecycle stage boundary so a failing create/check-in/cancel step is
+# identifiable in CI logs.
+stage() {
+  printf '\n\033[1;36m[integration][stage]\033[0m %s\n' "$1"
+}
+
+# Run a lifecycle invocation, reporting the stage name and exit status on
+# failure. The script runs under `set -e`, so a nonzero status here aborts the
+# whole run and propagates to the caller (e.g. the CI workflow job).
+run_stage() {
+  local name="$1"
+  shift
+  stage "BEGIN $name"
+  if ! "$@"; then
+    local status=$?
+    printf '\033[1;31m[integration][stage]\033[0m FAILED %s (exit %d)\n' "$name" "$status" >&2
+    exit "$status"
+  fi
+  stage "OK $name"
+}
+
 cleanup() {
   local status=$?
   if [ "$beneficiary_created" -eq 1 ]; then
@@ -153,7 +174,8 @@ echo "Owner balance before: $OWNER_BALANCE_BEFORE"
 echo "Contract balance before: $CONTRACT_BALANCE_BEFORE"
 
 log "create_will: locking $DEPOSIT_AMOUNT stroops for one beneficiary, 1-day check-in / 1-day grace"
-WILL_ID="$(stellar contract invoke \
+stage "BEGIN create_will"
+if ! WILL_ID="$(stellar contract invoke \
   --id "$CONTRACT_ID" \
   --source "$IDENTITY" \
   --network "$NETWORK" \
@@ -166,7 +188,12 @@ WILL_ID="$(stellar contract invoke \
   --guardians "[]" \
   --guardian_threshold 0 \
   --keeper_bounty_bps "null" \
-  --confirmation_delay_seconds 0)"
+  --confirmation_delay_seconds 0)"; then
+  status=$?
+  printf '\033[1;31m[integration][stage]\033[0m FAILED create_will (exit %d)\n' "$status" >&2
+  exit "$status"
+fi
+stage "OK create_will"
 echo "Created will id: $WILL_ID"
 
 log "Asserting deposit custody moved exactly $DEPOSIT_AMOUNT stroops into the contract"
@@ -205,14 +232,16 @@ if [[ "$STATUS" != *"Active"* ]]; then
 fi
 
 log "check_in: resetting the deadline"
-stellar contract invoke \
+run_stage check_in \
+  stellar contract invoke \
   --id "$CONTRACT_ID" \
   --source "$IDENTITY" \
   --network "$NETWORK" \
   -- check_in --will_id "$WILL_ID" --owner "$OWNER_ADDR"
 
 log "cancel_will: withdrawing the balance and closing the will"
-stellar contract invoke \
+run_stage cancel_will \
+  stellar contract invoke \
   --id "$CONTRACT_ID" \
   --source "$IDENTITY" \
   --network "$NETWORK" \

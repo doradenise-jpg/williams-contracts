@@ -6,6 +6,10 @@ on:
   pull_request:
     branches: [main]
 
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event_name == 'pull_request' && format('pr-{0}', github.event.pull_request.number) || format('ref-{0}', github.ref) }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
 env:
   # Pinned Rust toolchain from the tested version matrix (see docs/toolchain-matrix.md).
   # Update this together with the matrix and rerun native/WASM/local-host validation.
@@ -89,6 +93,20 @@ jobs:
         run: cargo check -p will --features fuzzing --locked
       - name: Verify guard catches broken feature-only derive
         run: bash scripts/check-fuzzing-feature-guard.sh
+
+  resource-costs:
+    name: Resource Cost Docs Drift
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Verify docs/RESOURCE_COSTS.md matches measured output
+        # The script exits non-zero on drift and also fails when profiling is
+        # disabled, so a skipped profile cannot be mistaken for a verified
+        # matching measurement. Do not add continue-on-error or conditional
+        # skipping here.
+        run: bash scripts/check_resource_costs.sh
 
   build-wasm:
     name: Build & Verify WASM Size

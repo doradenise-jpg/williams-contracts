@@ -13,20 +13,31 @@ a `proptest` case (or a plain `#[test]`) without rewriting it.
 
 ## Entry point coverage
 
-`WillContract` has around 35 public entry points. Only the two below are
-currently exercised by a `run_*`/`*Input` pair in `fuzz_harness.rs` (and thus
-by both the `proptest` suite and a `fuzz/fuzz_targets/` target):
+`WillContract` has around 35 public entry points. The table below lists every
+`run_*`/`*Input` pair in `fuzz_harness.rs` and every `[[bin]]` target in
+`fuzz/Cargo.toml`, and states whether the coverage is actually validated.
+"Present" means the harness code and fuzz target exist; "validated" means the
+target is known to build and run cleanly. A present-but-broken target is **not**
+working coverage — do not count it as such.
 
-| Entry point | Fuzzed |
-|---|---|
-| `create_will` | yes — `run_create_will` / `CreateWillInput` |
-| `update_beneficiaries` | yes — `run_update_beneficiaries` / `UpdateBeneficiariesInput` |
-| `merge_wills` | yes — `run_merge_wills` / `MergeWillsInput` |
-| `split_will` | yes — `run_split_will` / `SplitWillInput` |
-| `multi_token_distribution` | yes — `run_multi_token_distribution` / `MultiTokenDistributionInput` |
+| Entry point | Harness | Fuzz target | Status |
+|---|---|---|---|
+| `create_will` | `run_create_will` / `CreateWillInput` | `create_will` | working — validated |
+| `update_beneficiaries` | `run_update_beneficiaries` / `UpdateBeneficiariesInput` | `update_beneficiaries` | working — validated |
+| `merge_wills` | `run_merge_wills` / `MergeWillsInput` | `merge_wills` | working — validated |
+| `split_will` | `run_split_will` / `SplitWillInput` | `split_will` | working — validated |
+| `multi_token_distribution` | `run_multi_token_distribution` / `MultiTokenDistributionInput` | `multi_token_distribution` | working — validated |
+| `release_inheritance` | `run_release_inheritance` / `ReleaseInheritanceInput` | `release_inheritance` | **present but broken — not validated** (see [#61](https://github.com/willi-d7/williams-contracts/issues/61)) |
+| `reveal_and_claim` | `run_reveal_and_claim` / `RevealAndClaimInput` | `reveal_and_claim` | **present but broken — not validated** |
+
+The `release_inheritance` and `reveal_and_claim` frontends exist in the tree but
+are not known to compile or run; they must not be advertised as coverage until
+the underlying build blockers are resolved. The `proptest` suite only drives the
+five working runners.
 
 Every other state-mutating entry point has no coverage-guided fuzzing yet and
 is only exercised by hand-written unit tests:
+=======
 
 - `cancel_will`
 - `guardian_trigger`
@@ -75,8 +86,11 @@ On top of that, an accepted `create_will` must leave a will where:
 
 - the status is `Active`, the recorded balance equals the locked amount, and
   the contract's token balance matches it;
-- there are 1–10 beneficiaries, each with a share of 1–100, summing to exactly
-  100;
+- there are 1–10 beneficiaries; percentage shares are expressed in **basis
+  points** (10,000 = 100%), and the percentage shares of all beneficiaries
+  using percentage allocations sum to exactly 10,000. `FixedAmount`
+  allocations are excluded from that sum;
+=======
 - there are at most 3 guardians, with no address repeated (a repeated guardian
   makes the 2-of-N quorum unreachable);
 - both `last_checkin + checkin_period_days * 86_400` and
@@ -105,11 +119,19 @@ cargo test                                  # everything
 cargo test --package will fuzz_test         # just the fuzzing suite
 ```
 
-To explore harder than the default 48 cases per property:
+By default the suite runs **48 cases per property** when `PROPTEST_CASES` is
+unset — a bounded campaign that keeps CI fast. The suite honors the
+`PROPTEST_CASES` environment variable, so setting it actually expands (or
+shrinks) the campaign:
 
 ```sh
 PROPTEST_CASES=5000 cargo test --package will fuzz_test -- --nocapture
 ```
+
+The command above now genuinely runs 5000 cases per property rather than
+silently falling back to the default 48. An invalid value (for example a
+non-numeric string or zero) produces a clear diagnostic from `proptest`
+instead of being ignored.
 
 A failing case is written to `contracts/will/proptest-regressions/` and replayed
 on every subsequent run. **Commit that file** — it is how a regression stays
@@ -168,6 +190,10 @@ cargo +nightly fuzz run create_will
 cargo +nightly fuzz run update_beneficiaries
 cargo +nightly fuzz run merge_wills
 cargo +nightly fuzz run split_will
+cargo +nightly fuzz run multi_token_distribution
+# Present but broken — not validated (see issue #61); these may fail to build.
+cargo +nightly fuzz run release_inheritance
+cargo +nightly fuzz run reveal_and_claim
 ```
 
 Each target runs until you stop it. Useful flags — everything after `--` goes

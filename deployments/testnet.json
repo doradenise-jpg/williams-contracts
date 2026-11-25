@@ -2,5 +2,16 @@
   "WillContract": "CDLZFC3SYJYDZT7K67VZ75HPJVIEUVNIXF47ZG2FB2RMQQVU2HHGCYSC",
   "network": "testnet",
   "deployedAt": "2025-01-15T00:00:00Z",
-  "wasmHash": "0000000000000000000000000000000000000000000000000000000000000000"
+  "wasmHash": "0000000000000000000000000000000000000000000000000000000000000000",
+  "provenance": {
+    "sourceRevision": "0000000000000000000000000000000000000000",
+    "dirty": false,
+    "dirtyDisclosure": "Placeholder record: source revision and build inputs not yet captured for this artifact.",
+    "toolchain": {
+      "rustc": "0.0.0",
+      "cargo": "0.0.0",
+      "stellarCli": "0.0.0"
+    },
+    "buildCommand": "cargo build --release --target wasm32-unknown-unknown --locked"
+  }
 }

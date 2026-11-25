@@ -69,7 +69,14 @@ pub const CONTRACT_PRERELEASE_NUM: u32 = 0;
 /// Each component must be below 1_000; larger values would overlap adjacent
 /// fields. This is the single source of truth for the encoding so the
 /// contract constant and its tests cannot drift apart.
+///
+/// # Panics
+/// Panics if any component is greater than or equal to 1_000.
 pub const fn encode_version(major: u32, minor: u32, patch: u32) -> u32 {
+    assert!(
+        major < 1_000 && minor < 1_000 && patch < 1_000,
+        "version components must be below 1,000"
+    );
     major * 1_000_000 + minor * 1_000 + patch
 }
 
@@ -422,8 +429,23 @@ mod version_tests {
 
     #[test]
     fn decode_handles_max_components() {
-        let packed = encode_version(999, 999, 999);
-        assert_eq!(decode_version(packed), (999, 999, 999));
+        const MAX_PACKED: u32 = encode_version(999, 999, 999);
+        assert_eq!(decode_version(MAX_PACKED), (999, 999, 999));
+        for (major, minor, patch) in [(999, 0, 0), (0, 999, 0), (0, 0, 999)] {
+            assert_eq!(
+                decode_version(encode_version(major, minor, patch)),
+                (major, minor, patch)
+            );
+        }
+    }
+
+    #[test]
+    fn encode_rejects_out_of_range_components() {
+        for invalid in [1_000, u32::MAX] {
+            for (major, minor, patch) in [(invalid, 0, 0), (0, invalid, 0), (0, 0, invalid)] {
+                assert!(std::panic::catch_unwind(|| encode_version(major, minor, patch)).is_err());
+            }
+        }
     }
 
     #[test]

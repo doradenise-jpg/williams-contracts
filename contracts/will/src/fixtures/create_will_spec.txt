@@ -7,9 +7,24 @@
 # -------
 # The XDR spec fixture test (`test_xdr_spec.rs`) reads this file and
 # compares it against the spec generated at test time from the
-# `WillContract` implementation. If they differ, it means the `create_will`
-# API has changed (parameter names, types, or order) without the fixture
-# being updated — which is exactly the schema-drift signal we want to catch.
+# `WillContract` implementation.
+#
+# The comparison is split into two artifacts:
+#
+# 1. STRUCTURAL SIGNATURE (ABI guard) — the function name and the parameter
+#    names, types, and order, decoded from the spec entry. A mismatch here
+#    means the `create_will` API has changed and the ABI guard fails.
+# 2. DOCUMENTATION BYTES — the embedded rustdoc string carried in the spec
+#    entry. A mismatch here is reported as a documentation artifact update,
+#    not an ABI break, so a prose-only edit does not trigger interface
+#    coordination.
+#
+# COMPATIBILITY POLICY
+# --------------------
+# Interface or behavior changes require a version bump and a coordinated
+# update of this fixture (and the SDK's companion fixture). Pure
+# documentation edits are exempt from version bumps: they update the
+# documentation artifact only and remain visible in review.
 #
 # READ-ONLY BY DEFAULT
 # --------------------

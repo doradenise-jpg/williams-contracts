@@ -14,11 +14,9 @@ file to detect spec drift before it ships.
 - `will-v<crate-version>.json` — one file per released crate version, named
   after the `version` field in `contracts/will/Cargo.toml` at the time of
   export (e.g. `will-v0.1.0.json`, `will-v1.3.0.json`). Never overwritten once
-  published; a new crate version gets a new file.
-- `will-spec.schema.json` — the JSON Schema (draft 2020-12) describing the
-  repository-specific `functions` / `inputs` / `types` representation used by
-  the snapshot files. Both `will-v0.1.0.json` and `will-v1.3.0.json` declare
-  `"$schema": "./will-spec.schema.json"`, which resolves to this file.
+  published; a new crate version gets a new file. `scripts/export-spec.sh`
+  enforces this: it refuses to write over an existing snapshot unless the
+  explicit update mode described below is requested.
 - `will-v0.1.0.json` — initial baseline specification snapshot.
 - `will-v1.4.0.json` — adds `get_will_history_page_v2` with an exclusive
   `Option<u64>` cursor. To continue paging, pass the last returned
@@ -97,13 +95,37 @@ stellar contract bindings json \
 single, repeatable entry point (see that script for the exact invocation
 used by CI).
 
+### Overwrite policy
+
+The script never silently replaces a published snapshot:
+
+- **Default (write) mode** — if `spec/will-v<version>.json` already exists,
+  the script exits with an error and leaves the existing file untouched. To
+  publish a changed interface, bump the crate version so a new file is
+  created.
+- **Check mode** (`--check`) — regenerates the spec into temporary storage
+  and compares it against the existing snapshot without writing anything.
+  Use this in CI to detect drift.
+- **Update mode** (`--update`) — the only way to regenerate an existing
+  `will-v<version>.json`. It is intended solely for snapshots of an
+  *unreleased* crate version (e.g. while iterating on a PR before the
+  version is published). Never use it on a file that has already been
+  released or attached to a GitHub Release; those are immutable history.
+
+In every mode the export is first written to temporary storage and only
+installed at the final path after it succeeds. If the export fails, the
+existing snapshot's bytes are preserved unchanged.
+
 ## Update process
 
 1. Bump `version` in `contracts/will/Cargo.toml` as part of any PR that
    changes a public entry-point signature, `Will`/`Beneficiary`/`Guardian`/
    `WillStatus`, or `WillError`.
 2. Run `scripts/export-spec.sh` locally (or let the `Spec Export` CI
-   workflow do it) to regenerate `spec/will-v<new-version>.json`.
+   workflow do it) to generate `spec/will-v<new-version>.json`. Because the
+   version was bumped, this creates a new file; the script refuses to
+   overwrite an existing snapshot. If you need to regenerate a snapshot for
+   a version that has not been released yet, pass `--update` explicitly.
 3. Commit the new file alongside the code change — do not edit or delete
    previously published spec files, they are the historical record SDK
    consumers diff against.

@@ -119,6 +119,11 @@ fn batch_accepts_batch_max_and_rejects_one_more() {
     let (env, contract_id, owner, token) = setup();
     let client = WillContractClient::new(&env, &contract_id);
 
+    assert_eq!(
+        client.try_batch_create_wills(&owner, &Vec::new(&env)),
+        Err(Ok(WillError::InvalidCreationBatchSize.into()))
+    );
+
     // BATCH_MAX is 10.
     let mut at_max: Vec<WillSpec> = Vec::new(&env);
     for _ in 0..10 {
@@ -132,7 +137,7 @@ fn batch_accepts_batch_max_and_rejects_one_more() {
     }
     assert_eq!(
         client.try_batch_create_wills(&owner, &over_max),
-        Err(Ok(WillError::TooManyBeneficiaries.into()))
+        Err(Ok(WillError::InvalidCreationBatchSize.into()))
     );
 }
 
@@ -220,4 +225,27 @@ fn batch_rejects_cumulative_index_capacity_overflow() {
 
     // No partial state: the index still holds exactly max - 1 wills.
     assert_eq!(client.get_wills_by_owner(&owner, &None, &max).len(), max - 1);
+}
+
+#[test]
+fn guardian_count_has_its_own_error() {
+    let (env, contract_id, owner, token) = setup();
+    let client = WillContractClient::new(&env, &contract_id);
+    let mut will_spec = spec(&env, &token, 100_000, 10_000);
+    for _ in 0..crate::MAX_GUARDIANS {
+        will_spec.4.push_back(Address::generate(&env));
+    }
+    let id = client
+        .batch_create_wills(&owner, &vec![&env, will_spec.clone()])
+        .get(0)
+        .unwrap();
+    will_spec.4.push_back(Address::generate(&env));
+    assert_eq!(
+        client.try_batch_create_wills(&owner, &vec![&env, will_spec.clone()]),
+        Err(Ok(WillError::TooManyGuardians.into()))
+    );
+    assert_eq!(
+        client.try_update_guardians(&id, &owner, &will_spec.4),
+        Err(Ok(WillError::TooManyGuardians.into()))
+    );
 }

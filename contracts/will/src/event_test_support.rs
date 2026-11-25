@@ -138,8 +138,11 @@ pub fn option_u64_from(sc: &ScVal) -> Option<Option<u64>> {
 }
 
 /// Decodes a `Vec<u64>` from a tuple payload's XDR vector element.
-pub fn u64_list_from(sc: &[ScVal]) -> std::vec::Vec<u64> {
-    sc.iter().filter_map(u64_from).collect()
+///
+/// Returns `None` if any element is not a `u64`; malformed elements must not
+/// be silently dropped, or assertions could pass against a schema regression.
+pub fn u64_list_from(sc: &[ScVal]) -> Option<std::vec::Vec<u64>> {
+    sc.iter().map(u64_from).collect()
 }
 
 /// Decodes a `Vec<Symbol>` from a tuple payload's XDR vector element.
@@ -242,6 +245,11 @@ pub fn allocation_from(env: &Env, sc: &ScVal) -> Option<crate::Allocation> {
         // `Percentage(u32)` is an enum whose single variant carries a
         // one-element tuple; `FixedAmount(i128)` the same with an `i128`.
         ScVal::Map(Some(map)) => {
+            // The enum is a single-entry map; extra entries mean the payload
+            // does not match the expected schema.
+            if map.len() != 1 {
+                return None;
+            }
             let entry = map.iter().next()?;
             let variant = match &entry.key {
                 ScVal::Symbol(v) => symbol_value(env, v)?,

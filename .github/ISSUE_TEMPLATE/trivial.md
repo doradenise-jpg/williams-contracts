@@ -1,7 +1,7 @@
 ---
 name: "Trivial Task"
 about: Small fixes, documentation, minor improvements — 100 points
-labels: "complexity: trivial, good first issue"
+labels: "good first issue"
 assignees: ''
 ---
 

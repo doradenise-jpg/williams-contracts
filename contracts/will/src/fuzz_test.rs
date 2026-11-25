@@ -151,15 +151,60 @@ fn update_beneficiaries_input_strategy() -> impl Strategy<Value = UpdateBenefici
         )
 }
 
-// Each case registers a fresh Soroban env plus two contracts, so the case
-// counts are kept modest to hold the suite to a few seconds. Deep exploration
-// is cargo-fuzz's job; see docs/FUZZING.md.
-proptest! {
-    #![proptest_config(ProptestConfig {
-        cases: 48,
+/// Repository default for the number of generated cases per property.
+///
+/// Each case registers a fresh Soroban env plus two contracts, so the default
+/// is kept modest to hold the suite to a few seconds. Deep exploration is
+/// cargo-fuzz's job; see docs/FUZZING.md.
+pub(crate) const DEFAULT_PROPTEST_CASES: u32 = 48;
+
+/// Environment variable honoured as an override for the case count.
+const PROPTEST_CASES_ENV: &str = "PROPTEST_CASES";
+
+/// Builds the proptest configuration used by the stable fuzz suite.
+///
+/// `PROPTEST_CASES` is honoured when set (matching proptest's own convention),
+/// falling back to [`DEFAULT_PROPTEST_CASES`] when it is unset. Invalid values
+/// are reported on stderr and fall back to the default rather than silently
+/// running an unexpected campaign.
+pub(crate) fn fuzz_proptest_config() -> ProptestConfig {
+    let cases = match std::env::var(PROPTEST_CASES_ENV) {
+        Ok(raw) => match raw.trim().parse::<u32>() {
+            Ok(parsed) if parsed > 0 => parsed,
+            Ok(_) => {
+                eprintln!(
+                    "warning: {PROPTEST_CASES_ENV}={raw:?} must be a positive integer; \
+                     falling back to the default of {DEFAULT_PROPTEST_CASES} cases"
+                );
+                DEFAULT_PROPTEST_CASES
+            }
+            Err(err) => {
+                eprintln!(
+                    "warning: {PROPTEST_CASES_ENV}={raw:?} is not a valid case count ({err}); \
+                     falling back to the default of {DEFAULT_PROPTEST_CASES} cases"
+                );
+                DEFAULT_PROPTEST_CASES
+            }
+        },
+        Err(std::env::VarError::NotPresent) => DEFAULT_PROPTEST_CASES,
+        Err(err) => {
+            eprintln!(
+                "warning: could not read {PROPTEST_CASES_ENV} ({err}); \
+                 falling back to the default of {DEFAULT_PROPTEST_CASES} cases"
+            );
+            DEFAULT_PROPTEST_CASES
+        }
+    };
+
+    ProptestConfig {
+        cases,
         max_shrink_iters: 512,
         ..ProptestConfig::default()
-    })]
+    }
+}
+
+proptest! {
+    #![proptest_config(fuzz_proptest_config())]
 
     /// `create_will` must reject malformed input with a declared `WillError`,
     /// never by aborting, and every will it accepts must satisfy the
@@ -755,6 +800,60 @@ fn update_beneficiaries_rejects_overflowing_basis_points() {
     );
     // The rejected update must not have disturbed the stored list.
     assert_eq!(client.get_will(&will_id).beneficiaries, beneficiaries);
+}
+
+// ---------------------------------------------------------------------------
+// Configuration tests: PROPTEST_CASES must drive the effective case count.
+// ---------------------------------------------------------------------------
+
+/// Runs `f` with `PROPTEST_CASES` set to `value` (or unset when `None`),
+/// restoring the previous value afterwards. Tests touching the process
+/// environment are serialized through a mutex so they cannot race.
+fn with_proptest_cases<R>(value: Option<&str>, f: impl FnOnce() -> R) -> R {
+    use std::sync::Mutex;
+    static ENV_LOCK: Mutex<()> = Mutex::new(());
+    let _guard = ENV_LOCK.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+
+    let previous = std::env::var_os(PROPTEST_CASES_ENV);
+    match value {
+        Some(raw) => std::env::set_var(PROPTEST_CASES_ENV, raw),
+        None => std::env::remove_var(PROPTEST_CASES_ENV),
+    }
+    let result = f();
+    match previous {
+        Some(raw) => std::env::set_var(PROPTEST_CASES_ENV, raw),
+        None => std::env::remove_var(PROPTEST_CASES_ENV),
+    }
+    result
+}
+
+#[test]
+fn proptest_config_defaults_when_cases_unset() {
+    let cases = with_proptest_cases(None, || fuzz_proptest_config().cases);
+    assert_eq!(cases, DEFAULT_PROPTEST_CASES);
+}
+
+#[test]
+fn proptest_config_honours_small_case_override() {
+    let cases = with_proptest_cases(Some("3"), || fuzz_proptest_config().cases);
+    assert_eq!(cases, 3);
+}
+
+#[test]
+fn proptest_config_honours_large_case_override() {
+    let cases = with_proptest_cases(Some("5000"), || fuzz_proptest_config().cases);
+    assert_eq!(cases, 5000);
+}
+
+#[test]
+fn proptest_config_falls_back_on_invalid_override() {
+    for invalid in ["", "0", "not-a-number", "-5"] {
+        let cases = with_proptest_cases(Some(invalid), || fuzz_proptest_config().cases);
+        assert_eq!(
+            cases, DEFAULT_PROPTEST_CASES,
+            "invalid PROPTEST_CASES={invalid:?} should fall back to the default"
+        );
+    }
 }
 
 /// A checkin period one day above the maximum must still be rejected, not

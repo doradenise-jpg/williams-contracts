@@ -144,10 +144,10 @@ fn test_discrete_storage_keys_and_constant_gas_across_50_tokens() {
             .has(&DataKey::TotalLocked(token_0.clone())));
 
         // Profile CPU cost of updating an existing token when N = 1
-        env.budget().reset_default();
-        let cpu_before_1 = env.budget().cpu_instruction_cost();
+        env.cost_estimate().budget().reset_default();
+        let cpu_before_1 = env.cost_estimate().budget().cpu_instruction_cost();
         storage::adjust_locked_value(&env, token_0, 500);
-        let cpu_after_1 = env.budget().cpu_instruction_cost();
+        let cpu_after_1 = env.cost_estimate().budget().cpu_instruction_cost();
         let cost_at_1 = cpu_after_1 - cpu_before_1;
         assert!(
             cost_at_1 < 100_000,
@@ -171,22 +171,22 @@ fn test_discrete_storage_keys_and_constant_gas_across_50_tokens() {
 
         // Profile CPU cost of updating distinct tokens across the protocol when N = 50
         // (verifies constant gas and no positional vector-scan dependency)
-        env.budget().reset_default();
-        let cpu_before_first = env.budget().cpu_instruction_cost();
+        env.cost_estimate().budget().reset_default();
+        let cpu_before_first = env.cost_estimate().budget().cpu_instruction_cost();
         storage::adjust_locked_value(&env, token_0, 500);
-        let cpu_after_first = env.budget().cpu_instruction_cost();
+        let cpu_after_first = env.cost_estimate().budget().cpu_instruction_cost();
         let cost_first = cpu_after_first - cpu_before_first;
 
-        env.budget().reset_default();
-        let cpu_before_middle = env.budget().cpu_instruction_cost();
+        env.cost_estimate().budget().reset_default();
+        let cpu_before_middle = env.cost_estimate().budget().cpu_instruction_cost();
         storage::adjust_locked_value(&env, &tokens[25], 500);
-        let cpu_after_middle = env.budget().cpu_instruction_cost();
+        let cpu_after_middle = env.cost_estimate().budget().cpu_instruction_cost();
         let cost_middle = cpu_after_middle - cpu_before_middle;
 
-        env.budget().reset_default();
-        let cpu_before_last = env.budget().cpu_instruction_cost();
+        env.cost_estimate().budget().reset_default();
+        let cpu_before_last = env.cost_estimate().budget().cpu_instruction_cost();
         storage::adjust_locked_value(&env, &tokens[49], 500);
-        let cpu_after_last = env.budget().cpu_instruction_cost();
+        let cpu_after_last = env.cost_estimate().budget().cpu_instruction_cost();
         let cost_last = cpu_after_last - cpu_before_last;
 
         // Balance updates across 50 distinct tokens must be bounded and independent of token position
@@ -376,5 +376,66 @@ fn test_recompute_protocol_stats_chunked_with_100_plus_wills() {
             .map(|e| e.total_locked)
             .unwrap_or(0);
         assert_eq!(locked_in_full, (total_wills as i128) * 1_000);
+
+        // Zero-sized chunks must never report a populated registry as fully scanned.
+        let (zero_stats, zero_next, zero_complete) =
+            recompute_protocol_stats_chunk(&env, 1_u64, 0_u32);
+        assert!(
+            !zero_complete,
+            "zero-sized chunk must not report a populated registry as fully scanned"
+        );
+        assert_eq!(
+            zero_stats.active_will_count, 0,
+            "zero-sized chunk must not count any wills"
+        );
+        assert_eq!(
+            zero_next, 1_u64,
+            "zero-sized chunk must not advance the continuation cursor"
+        );
+
+        // A single-record chunk must advance and count exactly one live record.
+        let (one_stats, one_next, one_complete) =
+            recompute_protocol_stats_chunk(&env, 1_u64, 1_u32);
+        assert_eq!(one_stats.active_will_count, 1);
+        assert_eq!(one_next, 2_u64);
+        assert!(!one_complete);
+
+        // A start ID beyond the registry must terminate without counting anything.
+        let (beyond_stats, _beyond_next, beyond_complete) =
+            recompute_protocol_stats_chunk(&env, total_wills + 1, 20_u32);
+        assert_eq!(beyond_stats.active_will_count, 0);
+        assert!(
+            beyond_complete,
+            "start beyond the registry must report completion"
+        );
+
+        // Boundary start IDs near u64::MAX must not trap on arithmetic.
+        let (max_stats, _max_next, max_complete) =
+            recompute_protocol_stats_chunk(&env, u64::MAX, 20_u32);
+        assert_eq!(max_stats.active_will_count, 0);
+        assert!(
+            max_complete,
+            "start at u64::MAX must report completion without wrapping"
+        );
+
+        let (near_max_stats, _near_max_next, near_max_complete) =
+            recompute_protocol_stats_chunk(&env, u64::MAX - 1, u32::MAX);
+        assert_eq!(near_max_stats.active_will_count, 0);
+        assert!(
+            near_max_complete,
+            "oversized chunk near u64::MAX must not trap and must report completion"
+        );
+
+        // Rejection of malformed input must leave accumulated state unchanged.
+        let (rejected_stats, rejected_next, rejected_complete) =
+            recompute_protocol_stats_chunk(&env, 1_u64, 0_u32);
+        assert!(!rejected_complete);
+        assert_eq!(rejected_stats.active_will_count, 0);
+        assert_eq!(rejected_next, 1_u64);
+        assert_eq!(
+            storage::get_protocol_stats(&env).active_will_count,
+            total_wills,
+            "malformed chunk requests must not mutate stored protocol stats"
+        );
     });
 }
